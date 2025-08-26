@@ -1,0 +1,8 @@
+TypeError: (0 , baileyWrapper_1.makeCacheableSignalKeyStore) is not a function
+    at BaileysProvider.initVendor [90m(C:\Users\valem\OneDrive\Escritorio\builderbot-sherpa\packages\provider-baileys\[39msrc\bailey.ts:274:54[90m)[39m
+[90m    at processTicksAndRejections (node:internal/process/task_queues:105:5)[39m
+    at Object.<anonymous> [90m(C:\Users\valem\OneDrive\Escritorio\builderbot-sherpa\packages\provider-baileys\[39m__tests__\baileysProvider.test.ts:1242:13[90m)[39m
+TypeError: (0 , baileyWrapper_1.makeCacheableSignalKeyStore) is not a function
+    at BaileysProvider.initVendor [90m(C:\Users\valem\OneDrive\Escritorio\builderbot-sherpa\packages\provider-baileys\[39msrc\bailey.ts:274:54[90m)[39m
+[90m    at processTicksAndRejections (node:internal/process/task_queues:105:5)[39m
+    at Object.<anonymous> [90m(C:\Users\valem\OneDrive\Escritorio\builderbot-sherpa\packages\provider-baileys\[39m__tests__\baileysProvider.test.ts:1242:13[90m)[39m
