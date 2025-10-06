@@ -1,7 +1,7 @@
 import { ProviderClass, utils } from '@builderbot/bot'
 import type { BotContext, Button, SendOptions } from '@builderbot/bot/dist/types'
 import type { Boom } from '@hapi/boom'
-import { WAVersion, WABrowserDescription } from 'sherpa-baileys'
+import { WAVersion, WABrowserDescription } from 'baileys'
 import { Console } from 'console'
 import type { PathOrFileDescriptor } from 'fs'
 import { createReadStream, createWriteStream, readFileSync } from 'fs'

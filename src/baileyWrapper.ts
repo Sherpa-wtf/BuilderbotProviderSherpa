@@ -15,7 +15,7 @@ import {
     isJidGroup,
     isJidBroadcast,
     makeWASocket as makeWASocketOther,
-} from 'sherpa-baileys'
+} from 'baileys'
 
 export {
     makeWASocketOther,
