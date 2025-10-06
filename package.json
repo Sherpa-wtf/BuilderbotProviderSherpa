@@ -1,6 +1,6 @@
 {
   "name": "builderbot-provider-sherpa",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Sherpa provider for Builderbot",
   "keywords": [
     "builderbot",
@@ -24,7 +24,9 @@
     "build": "rimraf dist && rollup --config",
     "test": "jest --forceExit",
     "test:coverage": "jest --coverage",
-    "test:watch": "jest --watchAll --coverage"
+    "test:watch": "jest --watchAll --coverage",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
   },
   "files": [
     "./dist/"
