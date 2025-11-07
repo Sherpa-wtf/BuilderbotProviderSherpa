@@ -36,6 +36,7 @@ import {
   makeWASocketOther,
   proto,
   useMultiFileAuthState,
+  jidNormalizedUser,
 } from "./baileyWrapper";
 import { releaseTmp } from "./releaseTmp";
 import type { BaileyGlobalVendorArgs } from "./type";
@@ -267,7 +268,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
   protected getMessage = async (key: { remoteJid: string; id: string }) => {
     // only if store is present
-    return proto.Message.fromObject({});
+    return proto.Message.create({});
   };
 
   protected saveCredsGlobal: (() => Promise<void>) | null = null;
@@ -470,6 +471,14 @@ class BaileysProvider extends ProviderClass<WASocket> {
         await saveCreds();
       });
 
+      sock.ev.on("lid-mapping.update", async (mapping) => {
+        this.logger.log(
+          `[${new Date().toISOString()}] LID mapping update received:`,
+          mapping
+        );
+        // El mapeo se almacena automáticamente en sock.signalRepository.lidMapping
+      });
+
       return sock.ev;
     } catch (e) {
       this.logger.log(e);
@@ -506,7 +515,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
               this.mapSet.add(_messageCtx?.key?.remoteJid);
               const jid = _messageCtx?.key?.remoteJid;
 
-              await this.vendor.readMessages([_messageCtx?.key]);
+              // Removed readMessages() call - Baileys v7 no longer sends ACKs to prevent bans
               await this.vendor.sendMessage(jid, {
                 text: this.globalVendorArgs.experimentalSyncMessage,
               });
@@ -800,6 +809,42 @@ class BaileysProvider extends ProviderClass<WASocket> {
   getOrderDetails = async (orderId: string, orderToken: string) => {
     const orderDetails = await this.vendor.getOrderDetails(orderId, orderToken);
     return orderDetails;
+  };
+
+  /**
+   * Obtener LID (Local Identifier) para un número de teléfono (PN)
+   * @param {string} phoneNumber - Número de teléfono en formato JID (e.g., '1234567890@s.whatsapp.net')
+   * @returns {Promise<string|null>} - El LID correspondiente o null si no se encuentra
+   * @example await getLIDForPN('1234567890@s.whatsapp.net')
+   */
+  getLIDForPN = async (phoneNumber: string) => {
+    try {
+      if (this.vendor?.signalRepository?.lidMapping?.getLIDForPN) {
+        return await this.vendor.signalRepository.lidMapping.getLIDForPN(phoneNumber);
+      }
+      return null;
+    } catch (e) {
+      this.logger.log(`[${new Date().toISOString()}] Error getting LID for PN:`, e);
+      return null;
+    }
+  };
+
+  /**
+   * Obtener número de teléfono (PN) para un LID (Local Identifier)
+   * @param {string} lid - Local Identifier
+   * @returns {Promise<string|null>} - El número de teléfono correspondiente o null si no se encuentra
+   * @example await getPNForLID('lid:xxxxxx')
+   */
+  getPNForLID = async (lid: string) => {
+    try {
+      if (this.vendor?.signalRepository?.lidMapping?.getPNForLID) {
+        return await this.vendor.signalRepository.lidMapping.getPNForLID(lid);
+      }
+      return null;
+    } catch (e) {
+      this.logger.log(`[${new Date().toISOString()}] Error getting PN for LID:`, e);
+      return null;
+    }
   };
 
   /**
