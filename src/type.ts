@@ -1,5 +1,5 @@
 import type { GlobalVendorArgs } from '@builderbot/bot/dist/types'
-import { proto, WABrowserDescription, WAVersion } from 'baileys'
+import { proto, WABrowserDescription, WAVersion } from 'whaileys'
 export interface BaileyGlobalVendorArgs extends GlobalVendorArgs {
     gifPlayback: boolean
     usePairingCode: boolean

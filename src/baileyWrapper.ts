@@ -8,14 +8,13 @@ import {
     BaileysEventMap,
     AnyMediaMessageContent,
     AnyMessageContent,
-    PollMessageOptions,
     downloadMediaMessage,
     WAMessage,
     MessageUpsertType,
     isJidGroup,
     isJidBroadcast,
-    makeWASocket as makeWASocketOther,
-} from 'baileys'
+} from 'whaileys'
+import makeWASocketOther from 'whaileys'
 
 export {
     makeWASocketOther,
@@ -28,7 +27,6 @@ export {
     BaileysEventMap,
     AnyMediaMessageContent,
     AnyMessageContent,
-    PollMessageOptions,
     downloadMediaMessage,
     WAMessage,
     MessageUpsertType,

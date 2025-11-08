@@ -23,7 +23,7 @@ export default {
         commonjs(),
         nodeResolve({
             resolveOnly: (module) =>
-                !/ffmpeg|@adiwajshing|link-preview-js|@leifermendez\/baileys|baileys|@builderbot\/bot|sharp/i.test(
+                !/ffmpeg|@adiwajshing|link-preview-js|@leifermendez\/baileys|baileys|@builderbot\/bot|sharp|qrcode-terminal/i.test(
                     module
                 ),
         }),

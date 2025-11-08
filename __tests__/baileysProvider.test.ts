@@ -5,11 +5,10 @@ import { IStickerOptions } from 'wa-sticker-formatter'
 import fs from 'fs'
 import mime from 'mime-types'
 import { utils } from '@builderbot/bot'
-import { useMultiFileAuthState } from 'baileys-sherpa'
-
+import { useMultiFileAuthState } from '../src/baileyWrapper'
 const phoneNumber = '+123456789'
 
-jest.mock('baileys-sherpa', () => ({
+jest.mock('../src/baileyWrapper', () => ({
     downloadMediaMessage: jest.fn(),
     proto: {
         Message: {
@@ -524,84 +523,6 @@ describe('#BaileysProvider', () => {
         })
     })
 
-    describe('#sendPoll', () => {
-        test('should send poll message with correct options', async () => {
-            // Arrange
-            const numberIn = phoneNumber
-            const text = 'Please vote'
-            const poll = {
-                options: ['Option 1', 'Option 2', 'Option 3'],
-                multiselect: false,
-            }
-
-            const mockSendMessage = mockSendSuccess
-            provider.vendor.sendMessage = mockSendMessage
-
-            // Act
-            const result = await provider.sendPoll(numberIn, text, poll)
-
-            // Assert
-            expect(result).toEqual('success')
-            expect(mockSendMessage).toHaveBeenCalled()
-        })
-
-        test('should send poll message with correct options multiselect undefined', async () => {
-            // Arrange
-            const numberIn = phoneNumber
-            const text = 'Please vote'
-            const poll = {
-                options: ['Option 1', 'Option 2', 'Option 3'],
-                multiselect: undefined,
-            }
-
-            const mockSendMessage = mockSendSuccess
-            provider.vendor.sendMessage = mockSendMessage
-
-            // Act
-            const result = await provider.sendPoll(numberIn, text, poll)
-
-            // Assert
-            expect(result).toEqual('success')
-            expect(mockSendMessage).toHaveBeenCalled()
-        })
-
-        test('should send poll message with correct options multiselect true', async () => {
-            // Arrange
-            const numberIn = phoneNumber
-            const text = 'Please vote'
-            const poll = {
-                options: ['Option 1', 'Option 2', 'Option 3'],
-                multiselect: true,
-            }
-
-            const mockSendMessage = mockSendSuccess
-            provider.vendor.sendMessage = mockSendSuccess
-
-            // Act
-            const result = await provider.sendPoll(numberIn, text, poll)
-
-            // Assert
-            expect(result).toEqual('success')
-            expect(mockSendMessage).toHaveBeenCalled()
-        })
-
-        test('should return false if options length is less than 2', async () => {
-            // Arrange
-            const numberIn = phoneNumber
-            const text = 'Please vote'
-            const poll = {
-                options: ['Option 1'],
-                multiselect: false,
-            }
-
-            // Act
-            const result = await provider.sendPoll(numberIn, text, poll)
-
-            // Assert
-            expect(result).toBeFalsy()
-        })
-    })
-
     describe('#sendButtons', () => {
         test('should emit notice event with correct details', async () => {
             // Arrange
@@ -766,9 +687,9 @@ describe('#BaileysProvider', () => {
             const imageUrl = 'https://example.com/image.jpg'
             const text = 'Hello World'
             const fileDownloaded = 'path/to/downloaded/image.jpg'
-            ;(utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
-                fileDownloaded
-            )
+                ; (utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
+                    fileDownloaded
+                )
             jest.spyOn(mime, 'lookup').mockReturnValue('image/jpeg')
             const sendImageSpy = jest.spyOn(provider, 'sendImage').mockImplementation(async () => undefined)
 
@@ -786,9 +707,9 @@ describe('#BaileysProvider', () => {
             const videoUrl = 'https://example.com/video.mp4'
             const text = 'Hello World'
             const fileDownloaded = 'path/to/downloaded/audio.mp3'
-            ;(utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
-                fileDownloaded
-            )
+                ; (utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
+                    fileDownloaded
+                )
             jest.spyOn(mime, 'lookup').mockReturnValue('video/mp4')
             const sendVideoSpy = jest.spyOn(provider, 'sendVideo').mockImplementation(async () => undefined)
 
@@ -805,9 +726,9 @@ describe('#BaileysProvider', () => {
             const audioUrl = 'https://example.com/audio.mp3'
             const text = 'Hello World'
             const fileDownloaded = 'path/to/downloaded/audio.mp3'
-            ;(utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
-                fileDownloaded
-            )
+                ; (utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
+                    fileDownloaded
+                )
             jest.spyOn(mime, 'lookup').mockReturnValue('audio/mp3')
             const sendAudioSpy = jest.spyOn(provider, 'sendAudio').mockImplementation(async () => undefined)
             // Act
@@ -824,9 +745,9 @@ describe('#BaileysProvider', () => {
             const fileUrl = 'https://example.com/test.pdf'
             const text = 'Hello World'
             const fileDownloaded = 'path/to/downloaded/test.pdf'
-            ;(utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
-                fileDownloaded
-            )
+                ; (utils.generalDownload as jest.MockedFunction<typeof utils.generalDownload>).mockResolvedValue(
+                    fileDownloaded
+                )
             jest.spyOn(mime, 'lookup').mockReturnValue('text/plain')
             const sendFileSpy = jest.spyOn(provider, 'sendFile').mockImplementation(async () => undefined)
             // Act

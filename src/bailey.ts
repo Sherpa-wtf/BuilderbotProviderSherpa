@@ -5,7 +5,7 @@ import type {
   SendOptions,
 } from "@builderbot/bot/dist/types";
 import type { Boom } from "@hapi/boom";
-import { WAVersion, WABrowserDescription } from "baileys";
+import { WAVersion, WABrowserDescription } from "whaileys";
 import { Console } from "console";
 import type { PathOrFileDescriptor } from "fs";
 import { createReadStream, createWriteStream, readFileSync } from "fs";
@@ -23,7 +23,6 @@ import {
   AnyMediaMessageContent,
   AnyMessageContent,
   BaileysEventMap,
-  PollMessageOptions,
   WAMessage,
   WASocket,
   MessageUpsertType,
@@ -178,8 +177,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       const maxSize = 1000;
       if (this.idsDuplicates.length > maxSize) {
         this.logger.log(
-          `[${new Date().toISOString()}] Cleaning duplicates array: ${
-            this.idsDuplicates.length
+          `[${new Date().toISOString()}] Cleaning duplicates array: ${this.idsDuplicates.length
           } -> ${maxSize}`
         );
         this.idsDuplicates = this.idsDuplicates.slice(-maxSize); // Mantener solo los últimos 1000
@@ -188,8 +186,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       // Limpiar mapSet si tiene demasiadas entradas
       if (this.mapSet.size > maxSize) {
         this.logger.log(
-          `[${new Date().toISOString()}] Cleaning mapSet: ${
-            this.mapSet.size
+          `[${new Date().toISOString()}] Cleaning mapSet: ${this.mapSet.size
           } -> 0`
         );
         this.mapSet.clear();
@@ -239,7 +236,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       .get("/", this.indexHome);
   }
 
-  protected afterHttpServerInit(): void {}
+  protected afterHttpServerInit(): void { }
 
   public indexHome: polka.Middleware = (req, res) => {
     try {
@@ -307,10 +304,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: true,
         getMessage: this.getMessage,
-        msgRetryCounterCache: this.msgRetryCounterCache,
+        msgRetryCounterMap: {},
         userDevicesCache: this.userDevicesCache as any,
         retryRequestDelayMs: 1000, // Mayor delay entre reintentos
-        maxMsgRetryCount: 8, // Más intentos de reenvío
         connectTimeoutMs: 60_000, // 1 minuto timeout conexión
         keepAliveIntervalMs: 10_000, // Keep alive cada 10 segundos
         qrTimeout: 40_000, // 40 segundos para QR
@@ -321,32 +317,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
             return isJidGroup(jid) || isJidBroadcast(jid);
           }
           return false;
-        },
-        patchMessageBeforeSending: (message: {
-          deviceSentMessage: {
-            message: {
-              listMessage: { listType: proto.Message.ListMessage.ListType };
-            };
-          };
-          listMessage: { listType: proto.Message.ListMessage.ListType };
-        }) => {
-          if (
-            message.deviceSentMessage?.message?.listMessage?.listType ===
-            proto.Message.ListMessage.ListType.PRODUCT_LIST
-          ) {
-            message = JSON.parse(JSON.stringify(message));
-            message.deviceSentMessage.message.listMessage.listType =
-              proto.Message.ListMessage.ListType.SINGLE_SELECT;
-          }
-          if (
-            message.listMessage?.listType ==
-            proto.Message.ListMessage.ListType.PRODUCT_LIST
-          ) {
-            message = JSON.parse(JSON.stringify(message));
-            message.listMessage.listType =
-              proto.Message.ListMessage.ListType.SINGLE_SELECT;
-          }
-          return message;
         },
         ...this.globalVendorArgs,
       });
@@ -470,14 +440,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
         await saveCreds();
       });
 
-      sock.ev.on("lid-mapping.update", async (mapping) => {
-        this.logger.log(
-          `[${new Date().toISOString()}] LID mapping update received:`,
-          mapping
-        );
-        // El mapeo se almacena automáticamente en sock.signalRepository.lidMapping
-      });
-
       return sock.ev;
     } catch (e) {
       this.logger.log(e);
@@ -499,306 +461,305 @@ class BaileysProvider extends ProviderClass<WASocket> {
     event: keyof BaileysEventMap;
     func: (arg?: any, arg2?: any) => any;
   }[] => [
-    {
-      event: "messages.upsert",
-      func: async (argFromProvider) => {
-        const { messages, type } = argFromProvider as {
-          type: MessageUpsertType;
-          messages: WAMessage[];
-        };
-        if (type !== "notify") return;
+      {
+        event: "messages.upsert",
+        func: async (argFromProvider) => {
+          const { messages, type } = argFromProvider as {
+            type: MessageUpsertType;
+            messages: WAMessage[];
+          };
+          if (type !== "notify") return;
 
-        const pingMessageSync = async (_messageCtx: proto.IWebMessageInfo) => {
-          if (!this.mapSet.has(_messageCtx?.key?.remoteJid)) {
-            try {
-              this.mapSet.add(_messageCtx?.key?.remoteJid);
-              const jid = _messageCtx?.key?.remoteJid;
-
-              // Removed readMessages() call - Baileys v7 no longer sends ACKs to prevent bans
-              await this.vendor.sendMessage(jid, {
-                text: this.globalVendorArgs.experimentalSyncMessage,
-              });
-            } catch (e) {
-              this.logger.log(e);
-            }
-          }
-        };
-
-        for (const messageCtx of messages) {
-          if (
-            messageCtx?.messageStubParameters?.length &&
-            messageCtx.messageStubParameters[0].includes("absent")
-          )
-            continue;
-          if (
-            messageCtx?.messageStubParameters?.length &&
-            messageCtx.messageStubParameters[0].includes("No session")
-          )
-            continue;
-          if (
-            messageCtx?.messageStubParameters?.length &&
-            messageCtx.messageStubParameters[0].includes("Bad MAC")
-          )
-            continue;
-          if (
-            messageCtx?.messageStubParameters?.length &&
-            messageCtx.messageStubParameters[0].includes("Invalid")
-          ) {
-            if (this.globalVendorArgs.fallBackAction) {
+          const pingMessageSync = async (_messageCtx: proto.IWebMessageInfo) => {
+            if (!this.mapSet.has(_messageCtx?.key?.remoteJid)) {
               try {
-                await this.globalVendorArgs.fallBackAction(messageCtx);
-              } catch (error) {
+                this.mapSet.add(_messageCtx?.key?.remoteJid);
+                const jid = _messageCtx?.key?.remoteJid;
+
+                // Removed readMessages() call - Baileys v7 no longer sends ACKs to prevent bans
+                await this.vendor.sendMessage(jid, {
+                  text: this.globalVendorArgs.experimentalSyncMessage,
+                });
+              } catch (e) {
+                this.logger.log(e);
+              }
+            }
+          };
+
+          for (const messageCtx of messages) {
+            if (
+              messageCtx?.messageStubParameters?.length &&
+              messageCtx.messageStubParameters[0].includes("absent")
+            )
+              continue;
+            if (
+              messageCtx?.messageStubParameters?.length &&
+              messageCtx.messageStubParameters[0].includes("No session")
+            )
+              continue;
+            if (
+              messageCtx?.messageStubParameters?.length &&
+              messageCtx.messageStubParameters[0].includes("Bad MAC")
+            )
+              continue;
+            if (
+              messageCtx?.messageStubParameters?.length &&
+              messageCtx.messageStubParameters[0].includes("Invalid")
+            ) {
+              if (this.globalVendorArgs.fallBackAction) {
+                try {
+                  await this.globalVendorArgs.fallBackAction(messageCtx);
+                } catch (error) {
+                  continue;
+                }
+                continue;
+              }
+
+              if (
+                this.globalVendorArgs.experimentalSyncMessage &&
+                this.globalVendorArgs.experimentalSyncMessage.length
+              ) {
+                if (baileyIsValidNumber(messageCtx?.key?.remoteJid)) {
+                  await pingMessageSync(messageCtx);
+                }
                 continue;
               }
               continue;
             }
+            // if (((messageCtx?.message?.protocolMessage?.type) as unknown as string) === 'EPHEMERAL_SETTING') continue
 
-            if (
-              this.globalVendorArgs.experimentalSyncMessage &&
-              this.globalVendorArgs.experimentalSyncMessage.length
-            ) {
-              if (baileyIsValidNumber(messageCtx?.key?.remoteJid)) {
-                await pingMessageSync(messageCtx);
-              }
-              continue;
-            }
-            continue;
-          }
-          // if (((messageCtx?.message?.protocolMessage?.type) as unknown as string) === 'EPHEMERAL_SETTING') continue
+            const textToBody =
+              messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
+                ?.text ??
+              messageCtx?.message?.extendedTextMessage?.text ??
+              messageCtx?.message?.conversation;
 
-          const textToBody =
-            messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
-              ?.text ??
-            messageCtx?.message?.extendedTextMessage?.text ??
-            messageCtx?.message?.conversation;
-
-          if (textToBody) {
-            if (
-              textToBody === "requestPlaceholder" &&
-              !(messageCtx as any).requestId
-            ) {
-              try {
-                if (this.vendor.requestPlaceholderResend) {
-                  const messageId = await this.vendor.requestPlaceholderResend(
-                    messageCtx.key
-                  );
+            if (textToBody) {
+              if (
+                textToBody === "requestPlaceholder" &&
+                !(messageCtx as any).requestId
+              ) {
+                try {
+                  if (this.vendor.requestPlaceholderResend) {
+                    const messageId = await this.vendor.requestPlaceholderResend([
+                      { messageKey: messageCtx.key },
+                    ]);
+                    this.logger.log(
+                      `[${new Date().toISOString()}] Requested placeholder resync, id=${messageId}`
+                    );
+                  }
+                  continue; // No procesar como mensaje normal
+                } catch (e) {
                   this.logger.log(
-                    `[${new Date().toISOString()}] Requested placeholder resync, id=${messageId}`
+                    `[${new Date().toISOString()}] Error requesting placeholder resync:`,
+                    e
                   );
                 }
-                continue; // No procesar como mensaje normal
-              } catch (e) {
+              }
+
+              if (textToBody === "onDemandHistSync") {
+                try {
+                  if (this.vendor.fetchMessageHistory) {
+                    const messageId = await this.vendor.fetchMessageHistory(
+                      50,
+                      messageCtx.key,
+                      messageCtx.messageTimestamp
+                    );
+                    this.logger.log(
+                      `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
+                    );
+                  }
+                  continue; // No procesar como mensaje normal
+                } catch (e) {
+                  this.logger.log(
+                    `[${new Date().toISOString()}] Error requesting history sync:`,
+                    e
+                  );
+                }
+              }
+
+              if ((messageCtx as any).requestId) {
                 this.logger.log(
-                  `[${new Date().toISOString()}] Error requesting placeholder resync:`,
-                  e
+                  `[${new Date().toISOString()}] Message received from phone, id=${(messageCtx as any).requestId
+                  }`,
+                  messageCtx
                 );
               }
             }
 
-            if (textToBody === "onDemandHistSync") {
-              try {
-                if (this.vendor.fetchMessageHistory) {
-                  const messageId = await this.vendor.fetchMessageHistory(
-                    50,
-                    messageCtx.key,
-                    messageCtx.messageTimestamp
-                  );
-                  this.logger.log(
-                    `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
-                  );
-                }
-                continue; // No procesar como mensaje normal
-              } catch (e) {
-                this.logger.log(
-                  `[${new Date().toISOString()}] Error requesting history sync:`,
-                  e
-                );
+            let payload = {
+              ...messageCtx,
+              body: textToBody,
+              name: messageCtx?.pushName,
+              from: messageCtx?.key?.remoteJid,
+            };
+
+            if (messageCtx.message?.locationMessage) {
+              const { degreesLatitude, degreesLongitude } =
+                messageCtx.message.locationMessage;
+              if (
+                typeof degreesLatitude === "number" &&
+                typeof degreesLongitude === "number"
+              ) {
+                payload = {
+                  ...payload,
+                  body: utils.generateRefProvider("_event_location_"),
+                };
               }
             }
 
-            if ((messageCtx as any).requestId) {
-              this.logger.log(
-                `[${new Date().toISOString()}] Message received from phone, id=${
-                  (messageCtx as any).requestId
-                }`,
-                messageCtx
-              );
+            if (messageCtx.message?.videoMessage) {
+              payload = {
+                ...payload,
+                body: utils.generateRefProvider("_event_media_"),
+              };
             }
-          }
 
-          let payload = {
-            ...messageCtx,
-            body: textToBody,
-            name: messageCtx?.pushName,
-            from: messageCtx?.key?.remoteJid,
-          };
+            if (messageCtx.message?.stickerMessage) {
+              payload = {
+                ...payload,
+                body: utils.generateRefProvider("_event_media_"),
+              };
+            }
 
-          if (messageCtx.message?.locationMessage) {
-            const { degreesLatitude, degreesLongitude } =
-              messageCtx.message.locationMessage;
+            if (messageCtx.message?.imageMessage) {
+              payload = {
+                ...payload,
+                body: utils.generateRefProvider("_event_media_"),
+              };
+            }
+
             if (
-              typeof degreesLatitude === "number" &&
-              typeof degreesLongitude === "number"
+              messageCtx.message?.documentMessage ||
+              messageCtx.message?.documentWithCaptionMessage
             ) {
               payload = {
                 ...payload,
-                body: utils.generateRefProvider("_event_location_"),
+                body: utils.generateRefProvider("_event_document_"),
               };
             }
-          }
 
-          if (messageCtx.message?.videoMessage) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_media_"),
-            };
-          }
-
-          if (messageCtx.message?.stickerMessage) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_media_"),
-            };
-          }
-
-          if (messageCtx.message?.imageMessage) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_media_"),
-            };
-          }
-
-          if (
-            messageCtx.message?.documentMessage ||
-            messageCtx.message?.documentWithCaptionMessage
-          ) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_document_"),
-            };
-          }
-
-          if (messageCtx.message?.audioMessage) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_voice_note_"),
-            };
-          }
-
-          if (messageCtx.message?.orderMessage) {
-            payload = {
-              ...payload,
-              body: utils.generateRefProvider("_event_order_"),
-            };
-          }
-
-          if (payload.from === "status@broadcast") continue;
-          payload.from = baileyCleanNumber(payload.from, true);
-
-          if (
-            this.globalVendorArgs.writeMyself === "none" &&
-            payload?.key?.fromMe
-          )
-            continue;
-          if (
-            this.globalVendorArgs.host?.phone !== payload.from &&
-            payload?.key?.fromMe &&
-            !["both"].includes(this.globalVendorArgs.writeMyself)
-          )
-            continue;
-          if (
-            this.globalVendorArgs.host?.phone === payload.from &&
-            !["both", "host"].includes(this.globalVendorArgs.writeMyself)
-          )
-            continue;
-
-          if (!baileyIsValidNumber(payload.from)) {
-            continue;
-          }
-
-          const btnCtx =
-            payload?.message?.buttonsResponseMessage?.selectedDisplayText;
-          if (btnCtx) payload.body = btnCtx;
-
-          const listRowId = payload?.message?.listResponseMessage?.title;
-          if (listRowId) payload.body = listRowId;
-
-          const processDuplicate = () => {
-            if (messageCtx?.key?.id) {
-              const idWs = `${messageCtx.key.id}__${payload.from}`;
-              const isDuplicate = this.idsDuplicates.includes(idWs);
-              if (isDuplicate) {
-                this.idsDuplicates = [];
-                return false;
-              }
-              if (this.idsDuplicates.length > 10) {
-                this.idsDuplicates = [];
-              }
-              this.idsDuplicates.push(idWs);
-            }
-            return true;
-          };
-
-          if (processDuplicate()) {
-            this.emit("message", payload);
-          }
-        }
-      },
-    },
-    {
-      event: "messages.update",
-      func: async (message) => {
-        for (const { key, update } of message) {
-          if (update.pollUpdates) {
-            const pollCreation = await this.getMessage(key);
-            if (pollCreation) {
-              const pollMessage = getAggregateVotesInPollMessage({
-                message: pollCreation,
-                pollUpdates: update.pollUpdates,
-              });
-              const [messageCtx] = message;
-
-              if (
-                !messageCtx ||
-                !messageCtx.update ||
-                !messageCtx.update.pollUpdates ||
-                messageCtx.update.pollUpdates.length === 0
-              ) {
-                continue;
-              }
-
-              const payload = {
-                ...messageCtx,
-                body:
-                  pollMessage.find((poll) => poll.voters.length > 0)?.name ||
-                  "",
-                from: baileyCleanNumber(key.remoteJid, true),
-                voters: pollCreation,
-                type: "poll",
+            if (messageCtx.message?.audioMessage) {
+              payload = {
+                ...payload,
+                body: utils.generateRefProvider("_event_voice_note_"),
               };
+            }
+
+            if (messageCtx.message?.orderMessage) {
+              payload = {
+                ...payload,
+                body: utils.generateRefProvider("_event_order_"),
+              };
+            }
+
+            if (payload.from === "status@broadcast") continue;
+            payload.from = baileyCleanNumber(payload.from, true);
+
+            if (
+              this.globalVendorArgs.writeMyself === "none" &&
+              payload?.key?.fromMe
+            )
+              continue;
+            if (
+              this.globalVendorArgs.host?.phone !== payload.from &&
+              payload?.key?.fromMe &&
+              !["both"].includes(this.globalVendorArgs.writeMyself)
+            )
+              continue;
+            if (
+              this.globalVendorArgs.host?.phone === payload.from &&
+              !["both", "host"].includes(this.globalVendorArgs.writeMyself)
+            )
+              continue;
+
+            if (!baileyIsValidNumber(payload.from)) {
+              continue;
+            }
+
+            const btnCtx =
+              payload?.message?.buttonsResponseMessage?.selectedDisplayText;
+            if (btnCtx) payload.body = btnCtx;
+
+            const listRowId = payload?.message?.listResponseMessage?.title;
+            if (listRowId) payload.body = listRowId;
+
+            const processDuplicate = () => {
+              if (messageCtx?.key?.id) {
+                const idWs = `${messageCtx.key.id}__${payload.from}`;
+                const isDuplicate = this.idsDuplicates.includes(idWs);
+                if (isDuplicate) {
+                  this.idsDuplicates = [];
+                  return false;
+                }
+                if (this.idsDuplicates.length > 10) {
+                  this.idsDuplicates = [];
+                }
+                this.idsDuplicates.push(idWs);
+              }
+              return true;
+            };
+
+            if (processDuplicate()) {
               this.emit("message", payload);
             }
           }
-        }
+        },
       },
-    },
-    {
-      event: "call",
-      func: async ([call]) => {
-        if (call.status === "offer") {
-          const payload = {
-            from: baileyCleanNumber(call.from, true),
-            body: utils.generateRefProvider("_event_call_"),
-            call,
-          };
+      {
+        event: "messages.update",
+        func: async (message) => {
+          for (const { key, update } of message) {
+            if (update.pollUpdates) {
+              const pollCreation = await this.getMessage(key);
+              if (pollCreation) {
+                const pollMessage = getAggregateVotesInPollMessage({
+                  message: pollCreation,
+                  pollUpdates: update.pollUpdates,
+                });
+                const [messageCtx] = message;
 
-          this.emit("message", payload);
-          // Opcional: Rechazar automáticamente la llamada
-          // await this.vendor.rejectCall(call.id, call.from)
-        }
+                if (
+                  !messageCtx ||
+                  !messageCtx.update ||
+                  !messageCtx.update.pollUpdates ||
+                  messageCtx.update.pollUpdates.length === 0
+                ) {
+                  continue;
+                }
+
+                const payload = {
+                  ...messageCtx,
+                  body:
+                    pollMessage.find((poll) => poll.voters.length > 0)?.name ||
+                    "",
+                  from: baileyCleanNumber(key.remoteJid, true),
+                  voters: pollCreation,
+                  type: "poll",
+                };
+                this.emit("message", payload);
+              }
+            }
+          }
+        },
       },
-    },
-  ];
+      {
+        event: "call",
+        func: async ([call]) => {
+          if (call.status === "offer") {
+            const payload = {
+              from: baileyCleanNumber(call.from, true),
+              body: utils.generateRefProvider("_event_call_"),
+              call,
+            };
+
+            this.emit("message", payload);
+            // Opcional: Rechazar automáticamente la llamada
+            // await this.vendor.rejectCall(call.id, call.from)
+          }
+        },
+      },
+    ];
 
   /**
    * @param {string} orderId
@@ -818,8 +779,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
    */
   getLIDForPN = async (phoneNumber: string) => {
     try {
-      if (this.vendor?.signalRepository?.lidMapping?.getLIDForPN) {
-        return await this.vendor.signalRepository.lidMapping.getLIDForPN(
+      const vendor = this.vendor as any;
+      if (vendor?.signalRepository?.lidMapping?.getLIDForPN) {
+        return await vendor.signalRepository.lidMapping.getLIDForPN(
           phoneNumber
         );
       }
@@ -841,8 +803,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
    */
   getPNForLID = async (lid: string) => {
     try {
-      if (this.vendor?.signalRepository?.lidMapping?.getPNForLID) {
-        return await this.vendor.signalRepository.lidMapping.getPNForLID(lid);
+      const vendor = this.vendor as any;
+      if (vendor?.signalRepository?.lidMapping?.getPNForLID) {
+        return await vendor.signalRepository.lidMapping.getPNForLID(lid);
       }
       return null;
     } catch (e) {
@@ -993,34 +956,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
     return this.vendor.sendMessage(numberClean, buttonMessage);
   };
 
-  /**
-   *
-   * @param {string} number
-   * @param {string} text
-   * @param {string} footer
-   * @param {Array} poll
-   * @example await sendMessage("+XXXXXXXXXXX", { poll: { "name": "You accept terms", "values": [ "Yes", "Not"], "selectableCount": 1 })
-   */
-
-  sendPoll = async (
-    numberIn: string,
-    text: string,
-    poll: { options: string[]; multiselect: any }
-  ) => {
-    const numberClean = baileyCleanNumber(numberIn);
-
-    if (poll.options.length < 2) return false;
-
-    const pollMessage: PollMessageOptions = {
-      name: text,
-      values: poll.options,
-      selectableCount:
-        poll?.multiselect === undefined ? 1 : poll?.multiselect ? 1 : 0,
-    };
-    return this.vendor.sendMessage(numberClean, {
-      poll: pollMessage,
-    });
-  };
 
   /**
    * TODO: Necesita terminar de implementar el sendMedia y sendButton guiarse:
@@ -1215,8 +1150,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private async delayedReconnect(): Promise<void> {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.logger.log(
-        `[${new Date().toISOString()}] Max reconnection attempts reached (${
-          this.maxReconnectAttempts
+        `[${new Date().toISOString()}] Max reconnection attempts reached (${this.maxReconnectAttempts
         })`
       );
       this.emit("auth_failure", [
@@ -1235,8 +1169,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     ); // Max 30 segundos
 
     this.logger.log(
-      `[${new Date().toISOString()}] Reconnection attempt ${
-        this.reconnectAttempts
+      `[${new Date().toISOString()}] Reconnection attempt ${this.reconnectAttempts
       }/${this.maxReconnectAttempts} in ${delay}ms`
     );
 
