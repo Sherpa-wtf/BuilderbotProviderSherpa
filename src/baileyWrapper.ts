@@ -13,8 +13,8 @@ import {
     MessageUpsertType,
     isJidGroup,
     isJidBroadcast,
-} from 'whaileys'
-import makeWASocketOther from 'whaileys'
+} from 'baileys'
+import makeWASocketOther from 'baileys'
 
 export {
     makeWASocketOther,

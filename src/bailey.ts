@@ -5,7 +5,7 @@ import type {
   SendOptions,
 } from "@builderbot/bot/dist/types";
 import type { Boom } from "@hapi/boom";
-import { WAVersion, WABrowserDescription } from "whaileys";
+import { WAVersion, WABrowserDescription } from "baileys";
 import { Console } from "console";
 import type { PathOrFileDescriptor } from "fs";
 import { createReadStream, createWriteStream, readFileSync } from "fs";
@@ -304,7 +304,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: true,
         getMessage: this.getMessage,
-        msgRetryCounterMap: {},
+        msgRetryCounterCache: this.msgRetryCounterCache as any,
         userDevicesCache: this.userDevicesCache as any,
         retryRequestDelayMs: 1000, // Mayor delay entre reintentos
         connectTimeoutMs: 60_000, // 1 minuto timeout conexión
@@ -541,9 +541,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
               ) {
                 try {
                   if (this.vendor.requestPlaceholderResend) {
-                    const messageId = await this.vendor.requestPlaceholderResend([
-                      { messageKey: messageCtx.key },
-                    ]);
+                    const messageId = await this.vendor.requestPlaceholderResend(
+                      messageCtx.key
+                    );
                     this.logger.log(
                       `[${new Date().toISOString()}] Requested placeholder resync, id=${messageId}`
                     );
