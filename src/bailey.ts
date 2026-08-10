@@ -15,6 +15,7 @@ import NodeCache from "node-cache";
 import { tmpdir } from "os";
 import { join, basename, resolve } from "path";
 import pino from "pino";
+import { Writable } from "stream";
 import type polka from "polka";
 import type { IStickerOptions } from "wa-sticker-formatter";
 import { Sticker } from "wa-sticker-formatter";
@@ -45,6 +46,16 @@ import {
   emptyDirSessions,
 } from "./utils";
 
+/**
+ * Ventana de recuperacion para mensajes que WhatsApp entrega por sincronizacion
+ * (reconexion del socket, historial, otro dispositivo enlazado) en vez de en
+ * tiempo real. Recuperamos solo los mas nuevos que esto para no revivir
+ * conversaciones viejas cada vez que el socket se reconecta.
+ */
+const SYNCED_MESSAGE_MAX_AGE_SECONDS = Number(
+  process.env.BAILEYS_SYNCED_MESSAGE_MAX_AGE_SECONDS || 6 * 60 * 60 // 6 horas
+);
+
 class BaileysProvider extends ProviderClass<WASocket> {
   public globalVendorArgs: BaileyGlobalVendorArgs = {
     name: `bot`,
@@ -74,12 +85,20 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
   msgRetryCounterCache?: NodeCache;
   userDevicesCache?: NodeCache;
+  /**
+   * Mensajes que enviamos, para poder reenviarlos cuando el peer manda un
+   * retry receipt (no pudo desencriptar). Sin esto getMessage no tiene de donde
+   * sacar el original y la sesion Signal se queda desincronizada.
+   */
+  sentMessagesCache?: NodeCache;
 
   private logger: Console;
   private logStream: NodeJS.WritableStream;
 
-  private idsDuplicates = [];
   private mapSet = new Set();
+
+  /** Ids ya procesados, para no re-emitir mensajes sincronizados. */
+  private processedMessagesCache?: NodeCache;
 
   constructor(args: Partial<BaileyGlobalVendorArgs>) {
     super();
@@ -90,9 +109,25 @@ class BaileysProvider extends ProviderClass<WASocket> {
       emitClose: true,
     });
 
+    // El log del provider iba SOLO a baileys.log, un archivo dentro del
+    // contenedor: en Railway (y en cualquier deploy efimero) esos diagnosticos
+    // eran invisibles y se perdian en cada reinicio. Duplicamos a stdout para
+    // que las caidas/reconexiones del socket queden en el log del deploy.
+    const teeStream = new Writable({
+      write: (chunk, _encoding, callback) => {
+        try {
+          this.logStream.write(chunk);
+          process.stdout.write(chunk);
+        } catch {
+          // Nunca romper el flujo del bot por un fallo de logging.
+        }
+        callback();
+      },
+    });
+
     this.logger = new Console({
-      stdout: this.logStream,
-      stderr: this.logStream,
+      stdout: teeStream,
+      stderr: teeStream,
     });
 
     this.msgRetryCounterCache = new NodeCache({
@@ -109,6 +144,26 @@ class BaileysProvider extends ProviderClass<WASocket> {
       stdTTL: 7200, // 2 horas (dispositivos cambian poco)
       checkperiod: 600, // Limpieza cada 10 minutos
       maxKeys: 5000, // Más dispositivos
+      deleteOnExpire: true,
+      useClones: false,
+      forceString: false,
+      errorOnMissing: false,
+    });
+
+    this.sentMessagesCache = new NodeCache({
+      stdTTL: 1800, // 30 min: cubre de sobra la ventana de retry de WhatsApp
+      checkperiod: 300,
+      maxKeys: 20000,
+      deleteOnExpire: true,
+      useClones: false,
+      forceString: false,
+      errorOnMissing: false,
+    });
+
+    this.processedMessagesCache = new NodeCache({
+      stdTTL: SYNCED_MESSAGE_MAX_AGE_SECONDS, // mismo horizonte que la recuperación
+      checkperiod: 600,
+      maxKeys: 50000,
       deleteOnExpire: true,
       useClones: false,
       forceString: false,
@@ -175,13 +230,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // Limpiar duplicados cada 10 minutos para evitar memory leaks
     setInterval(() => {
       const maxSize = 1000;
-      if (this.idsDuplicates.length > maxSize) {
-        this.logger.log(
-          `[${new Date().toISOString()}] Cleaning duplicates array: ${this.idsDuplicates.length
-          } -> ${maxSize}`
-        );
-        this.idsDuplicates = this.idsDuplicates.slice(-maxSize); // Mantener solo los últimos 1000
-      }
+      // Los ids procesados ya viven en un NodeCache con TTL y maxKeys, que se
+      // purga solo; no hace falta recortarlos a mano.
 
       // Limpiar mapSet si tiene demasiadas entradas
       if (this.mapSet.size > maxSize) {
@@ -206,8 +256,17 @@ class BaileysProvider extends ProviderClass<WASocket> {
         this.userDevicesCache = undefined;
       }
 
+      if (this.sentMessagesCache) {
+        this.sentMessagesCache.close();
+        this.sentMessagesCache = undefined;
+      }
+
+      if (this.processedMessagesCache) {
+        this.processedMessagesCache.close();
+        this.processedMessagesCache = undefined;
+      }
+
       this.mapSet.clear();
-      this.idsDuplicates.length = 0;
 
       if (this.logStream && typeof this.logStream.end === "function") {
         this.logStream.end();
@@ -262,9 +321,85 @@ class BaileysProvider extends ProviderClass<WASocket> {
     }
   };
 
-  protected getMessage = async (key: { remoteJid: string; id: string }) => {
-    // only if store is present
-    return proto.Message.create({});
+  /**
+   * Baileys llama a esto cuando el peer manda un retry receipt (no pudo
+   * desencriptar lo que le mandamos) para reenviar el original.
+   *
+   * Antes devolvia proto.Message.create({}) — un mensaje VACIO. Eso es peor que
+   * no devolver nada: Baileys reenvia un payload vacio, el peer recibe basura y
+   * la sesion Signal queda desincronizada. Devolver undefined le dice a Baileys
+   * que no puede reenviar y que maneje el caso.
+   */
+  protected getMessage = async (key: {
+    remoteJid: string;
+    id: string;
+  }): Promise<proto.IMessage | undefined> => {
+    const cached = this.sentMessagesCache?.get<proto.IMessage>(
+      `${key?.remoteJid}_${key?.id}`
+    );
+    if (cached) return cached;
+
+    this.logger.log(
+      `[${new Date().toISOString()}] [GET_MESSAGE_MISS] No tenemos el original para reenviar. jid=${key?.remoteJid} id=${key?.id}`
+    );
+    return undefined;
+  };
+
+  /**
+   * Todo mensaje entrante que descartamos pasa por aca. Antes cada `continue`
+   * era mudo, asi que un mensaje perdido no dejaba NINGUN rastro: ni en el log
+   * del deploy, ni en el CRM, ni en una alerta. Un tag unico y grepeable es lo
+   * que permite medir cuanto se pierde y por que.
+   */
+  protected logDroppedMessage = (
+    reason: string,
+    messageCtx: Partial<proto.IWebMessageInfo>,
+    extra?: Record<string, unknown>
+  ) => {
+    try {
+      const detail = {
+        reason,
+        from: messageCtx?.key?.remoteJid ?? null,
+        id: messageCtx?.key?.id ?? null,
+        fromMe: messageCtx?.key?.fromMe ?? null,
+        timestamp: messageCtx?.messageTimestamp
+          ? Number(messageCtx.messageTimestamp)
+          : null,
+        pushName: messageCtx?.pushName ?? null,
+        ...(extra || {}),
+      };
+      this.logger.log(
+        `[${new Date().toISOString()}] [BAILEYS_MESSAGE_DROPPED] ${JSON.stringify(detail)}`
+      );
+    } catch {
+      // El logging nunca debe tumbar la ingesta.
+    }
+  };
+
+  /**
+   * Pide a WhatsApp que reenvie un mensaje que no pudimos desencriptar.
+   * Reemplaza al `continue` mudo de los casos "No session" / "Bad MAC".
+   */
+  protected requestResendOfUndecryptable = async (
+    reason: string,
+    messageCtx: proto.IWebMessageInfo
+  ) => {
+    this.logDroppedMessage(reason, messageCtx, { recoveryAttempted: true });
+    try {
+      if (this.vendor?.requestPlaceholderResend && messageCtx?.key) {
+        const requestId = await this.vendor.requestPlaceholderResend(
+          messageCtx.key
+        );
+        this.logger.log(
+          `[${new Date().toISOString()}] [BAILEYS_RESEND_REQUESTED] reason=${reason} jid=${messageCtx.key.remoteJid} id=${messageCtx.key.id} requestId=${requestId}`
+        );
+      }
+    } catch (e) {
+      this.logger.log(
+        `[${new Date().toISOString()}] [BAILEYS_RESEND_FAILED] reason=${reason} jid=${messageCtx?.key?.remoteJid}`,
+        e
+      );
+    }
   };
 
   protected saveCredsGlobal: (() => Promise<void>) | null = null;
@@ -275,7 +410,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
   protected initVendor = async () => {
     const NAME_DIR_SESSION = `${this.globalVendorArgs.name}_sessions`;
     const { state, saveCreds } = await useMultiFileAuthState(NAME_DIR_SESSION);
-    const loggerBaileys = pino({ level: "fatal" });
+    // Estaba en "fatal", que silencia TODOS los errores de desencriptado de
+    // Baileys ("Bad MAC", "No session", "failed to decrypt"). Sin eso no habia
+    // forma de saber que un mensaje entrante se habia perdido. pino escribe a
+    // stdout, asi que ahora si llega al log del deploy.
+    const loggerBaileys = pino({
+      level: process.env.BAILEYS_LOG_LEVEL || "warn",
+    });
 
     this.saveCredsGlobal = saveCreds;
 
@@ -320,6 +461,34 @@ class BaileysProvider extends ProviderClass<WASocket> {
         },
         ...this.globalVendorArgs,
       });
+
+      // Envolvemos sendMessage en UN solo punto (en vez de parchear los ~12
+      // call sites) para guardar cada mensaje enviado. Es lo que alimenta a
+      // getMessage cuando el peer pide un reenvio.
+      // Todo el wrapper va en try/catch: si la propiedad no fuera asignable
+      // preferimos quedarnos sin cache antes que impedir el arranque del bot.
+      try {
+        const originalSendMessage = sock.sendMessage.bind(sock);
+        sock.sendMessage = (async (jid: any, content: any, options?: any) => {
+          const sent = await originalSendMessage(jid, content, options);
+          try {
+            if (sent?.key?.id && sent?.message) {
+              this.sentMessagesCache?.set(
+                `${sent.key.remoteJid}_${sent.key.id}`,
+                sent.message
+              );
+            }
+          } catch {
+            // Cachear es best-effort: nunca romper un envio por esto.
+          }
+          return sent;
+        }) as typeof sock.sendMessage;
+      } catch (e) {
+        this.logger.log(
+          `[${new Date().toISOString()}] [SENT_CACHE_WRAP_FAILED] getMessage no podra reenviar originales`,
+          e
+        );
+      }
 
       this.vendor = sock;
       if (
@@ -460,250 +629,327 @@ class BaileysProvider extends ProviderClass<WASocket> {
   protected busEvents = (): {
     event: keyof BaileysEventMap;
     func: (arg?: any, arg2?: any) => any;
-  }[] => [
-      {
-        event: "messages.upsert",
-        func: async (argFromProvider) => {
-          const { messages, type } = argFromProvider as {
-            type: MessageUpsertType;
-            messages: WAMessage[];
-          };
-          if (type !== "notify") return;
+  }[] => {
+    const handleMessagesUpsert = async (argFromProvider) => {
+      const { messages, type } = argFromProvider as {
+        type: MessageUpsertType;
+        messages: WAMessage[];
+      };
 
-          const pingMessageSync = async (_messageCtx: proto.IWebMessageInfo) => {
-            if (!this.mapSet.has(_messageCtx?.key?.remoteJid)) {
-              try {
-                this.mapSet.add(_messageCtx?.key?.remoteJid);
-                const jid = _messageCtx?.key?.remoteJid;
+      // Antes: `if (type !== "notify") return;` — descartaba el batch entero
+      // sin log. Los mensajes que WhatsApp entrega por sincronizacion (tipo
+      // "append": tras una reconexion, o desde otro dispositivo enlazado)
+      // se perdian para siempre y en silencio. El socket se cae ~1 vez por
+      // hora, asi que esa ventana no es teorica.
+      //
+      // Los recuperamos, pero SOLO los recientes: procesar historial viejo
+      // haria que el bot conteste conversaciones de hace meses al reconectar.
+      let messagesToProcess = messages;
+      if (type !== "notify") {
+        const cutoffSeconds =
+          Math.floor(Date.now() / 1000) - SYNCED_MESSAGE_MAX_AGE_SECONDS;
+        messagesToProcess = (messages || []).filter((m) => {
+          const timestamp = Number(m?.messageTimestamp ?? 0);
+          return !m?.key?.fromMe && timestamp >= cutoffSeconds;
+        });
 
-                // Removed readMessages() call - Baileys v7 no longer sends ACKs to prevent bans
-                await this.vendor.sendMessage(jid, {
-                  text: this.globalVendorArgs.experimentalSyncMessage,
-                });
-              } catch (e) {
-                this.logger.log(e);
-              }
+        this.logger.log(
+          `[${new Date().toISOString()}] [BAILEYS_UPSERT_SYNCED] type=${type} recibidos=${messages?.length ?? 0} recuperados=${messagesToProcess.length}`
+        );
+
+        for (const skipped of (messages || []).filter(
+          (m) => !messagesToProcess.includes(m)
+        )) {
+          this.logDroppedMessage("synced_message_too_old_or_own", skipped, {
+            upsertType: type,
+          });
+        }
+
+        if (!messagesToProcess.length) return;
+      }
+
+      const pingMessageSync = async (_messageCtx: proto.IWebMessageInfo) => {
+        if (!this.mapSet.has(_messageCtx?.key?.remoteJid)) {
+          try {
+            this.mapSet.add(_messageCtx?.key?.remoteJid);
+            const jid = _messageCtx?.key?.remoteJid;
+
+            // Removed readMessages() call - Baileys v7 no longer sends ACKs to prevent bans
+            await this.vendor.sendMessage(jid, {
+              text: this.globalVendorArgs.experimentalSyncMessage,
+            });
+          } catch (e) {
+            this.logger.log(e);
+          }
+        }
+      };
+
+      for (const messageCtx of messagesToProcess) {
+        // "absent" / "No session" / "Bad MAC" = WhatsApp nos entrego un
+        // mensaje que no pudimos desencriptar. Antes los tres eran un
+        // `continue` mudo, y ese es el agujero por el que se cae un mensaje
+        // de cliente sin dejar rastro en ningun lado. Ahora se loguean y se
+        // pide reenvio.
+        const stubParameter = messageCtx?.messageStubParameters?.length
+          ? messageCtx.messageStubParameters[0]
+          : null;
+
+        if (stubParameter?.includes("absent")) {
+          await this.requestResendOfUndecryptable("absent", messageCtx);
+          continue;
+        }
+        if (stubParameter?.includes("No session")) {
+          await this.requestResendOfUndecryptable("no_session", messageCtx);
+          continue;
+        }
+        if (stubParameter?.includes("Bad MAC")) {
+          await this.requestResendOfUndecryptable("bad_mac", messageCtx);
+          continue;
+        }
+        if (stubParameter?.includes("Invalid")) {
+          this.logDroppedMessage("invalid_stub_parameter", messageCtx, {
+            stubParameter,
+          });
+          if (this.globalVendorArgs.fallBackAction) {
+            try {
+              await this.globalVendorArgs.fallBackAction(messageCtx);
+            } catch (error) {
+              continue;
             }
-          };
+            continue;
+          }
 
-          for (const messageCtx of messages) {
-            if (
-              messageCtx?.messageStubParameters?.length &&
-              messageCtx.messageStubParameters[0].includes("absent")
-            )
-              continue;
-            if (
-              messageCtx?.messageStubParameters?.length &&
-              messageCtx.messageStubParameters[0].includes("No session")
-            )
-              continue;
-            if (
-              messageCtx?.messageStubParameters?.length &&
-              messageCtx.messageStubParameters[0].includes("Bad MAC")
-            )
-              continue;
-            if (
-              messageCtx?.messageStubParameters?.length &&
-              messageCtx.messageStubParameters[0].includes("Invalid")
-            ) {
-              if (this.globalVendorArgs.fallBackAction) {
-                try {
-                  await this.globalVendorArgs.fallBackAction(messageCtx);
-                } catch (error) {
-                  continue;
-                }
-                continue;
-              }
-
-              if (
-                this.globalVendorArgs.experimentalSyncMessage &&
-                this.globalVendorArgs.experimentalSyncMessage.length
-              ) {
-                if (baileyIsValidNumber(messageCtx?.key?.remoteJid)) {
-                  await pingMessageSync(messageCtx);
-                }
-                continue;
-              }
-              continue;
+          if (
+            this.globalVendorArgs.experimentalSyncMessage &&
+            this.globalVendorArgs.experimentalSyncMessage.length
+          ) {
+            if (baileyIsValidNumber(messageCtx?.key?.remoteJid)) {
+              await pingMessageSync(messageCtx);
             }
-            // if (((messageCtx?.message?.protocolMessage?.type) as unknown as string) === 'EPHEMERAL_SETTING') continue
+            continue;
+          }
+          continue;
+        }
+        // if (((messageCtx?.message?.protocolMessage?.type) as unknown as string) === 'EPHEMERAL_SETTING') continue
 
-            const textToBody =
-              messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
-                ?.text ??
-              messageCtx?.message?.extendedTextMessage?.text ??
-              messageCtx?.message?.conversation;
+        const textToBody =
+          messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
+            ?.text ??
+          messageCtx?.message?.extendedTextMessage?.text ??
+          messageCtx?.message?.conversation;
 
-            if (textToBody) {
-              if (
-                textToBody === "requestPlaceholder" &&
-                !(messageCtx as any).requestId
-              ) {
-                try {
-                  if (this.vendor.requestPlaceholderResend) {
-                    const messageId = await this.vendor.requestPlaceholderResend(
-                      messageCtx.key
-                    );
-                    this.logger.log(
-                      `[${new Date().toISOString()}] Requested placeholder resync, id=${messageId}`
-                    );
-                  }
-                  continue; // No procesar como mensaje normal
-                } catch (e) {
-                  this.logger.log(
-                    `[${new Date().toISOString()}] Error requesting placeholder resync:`,
-                    e
-                  );
-                }
-              }
-
-              if (textToBody === "onDemandHistSync") {
-                try {
-                  if (this.vendor.fetchMessageHistory) {
-                    const messageId = await this.vendor.fetchMessageHistory(
-                      50,
-                      messageCtx.key,
-                      messageCtx.messageTimestamp
-                    );
-                    this.logger.log(
-                      `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
-                    );
-                  }
-                  continue; // No procesar como mensaje normal
-                } catch (e) {
-                  this.logger.log(
-                    `[${new Date().toISOString()}] Error requesting history sync:`,
-                    e
-                  );
-                }
-              }
-
-              if ((messageCtx as any).requestId) {
+        if (textToBody) {
+          if (
+            textToBody === "requestPlaceholder" &&
+            !(messageCtx as any).requestId
+          ) {
+            try {
+              if (this.vendor.requestPlaceholderResend) {
+                const messageId = await this.vendor.requestPlaceholderResend(
+                  messageCtx.key
+                );
                 this.logger.log(
-                  `[${new Date().toISOString()}] Message received from phone, id=${(messageCtx as any).requestId
-                  }`,
-                  messageCtx
+                  `[${new Date().toISOString()}] Requested placeholder resync, id=${messageId}`
                 );
               }
-            }
-
-            let payload = {
-              ...messageCtx,
-              body: textToBody,
-              name: messageCtx?.pushName,
-              from: messageCtx?.key?.remoteJid,
-            };
-
-            if (messageCtx.message?.locationMessage) {
-              const { degreesLatitude, degreesLongitude } =
-                messageCtx.message.locationMessage;
-              if (
-                typeof degreesLatitude === "number" &&
-                typeof degreesLongitude === "number"
-              ) {
-                payload = {
-                  ...payload,
-                  body: utils.generateRefProvider("_event_location_"),
-                };
-              }
-            }
-
-            if (messageCtx.message?.videoMessage) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_media_"),
-              };
-            }
-
-            if (messageCtx.message?.stickerMessage) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_media_"),
-              };
-            }
-
-            if (messageCtx.message?.imageMessage) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_media_"),
-              };
-            }
-
-            if (
-              messageCtx.message?.documentMessage ||
-              messageCtx.message?.documentWithCaptionMessage
-            ) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_document_"),
-              };
-            }
-
-            if (messageCtx.message?.audioMessage) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_voice_note_"),
-              };
-            }
-
-            if (messageCtx.message?.orderMessage) {
-              payload = {
-                ...payload,
-                body: utils.generateRefProvider("_event_order_"),
-              };
-            }
-
-            if (payload.from === "status@broadcast") continue;
-            payload.from = baileyCleanNumber(payload.from, true);
-
-            if (
-              this.globalVendorArgs.writeMyself === "none" &&
-              payload?.key?.fromMe
-            )
-              continue;
-            if (
-              this.globalVendorArgs.host?.phone !== payload.from &&
-              payload?.key?.fromMe &&
-              !["both"].includes(this.globalVendorArgs.writeMyself)
-            )
-              continue;
-            if (
-              this.globalVendorArgs.host?.phone === payload.from &&
-              !["both", "host"].includes(this.globalVendorArgs.writeMyself)
-            )
-              continue;
-
-            if (!baileyIsValidNumber(payload.from)) {
-              continue;
-            }
-
-            const btnCtx =
-              payload?.message?.buttonsResponseMessage?.selectedDisplayText;
-            if (btnCtx) payload.body = btnCtx;
-
-            const listRowId = payload?.message?.listResponseMessage?.title;
-            if (listRowId) payload.body = listRowId;
-
-            const processDuplicate = () => {
-              if (messageCtx?.key?.id) {
-                const idWs = `${messageCtx.key.id}__${payload.from}`;
-                const isDuplicate = this.idsDuplicates.includes(idWs);
-                if (isDuplicate) {
-                  this.idsDuplicates = [];
-                  return false;
-                }
-                if (this.idsDuplicates.length > 10) {
-                  this.idsDuplicates = [];
-                }
-                this.idsDuplicates.push(idWs);
-              }
-              return true;
-            };
-
-            if (processDuplicate()) {
-              this.emit("message", payload);
+              continue; // No procesar como mensaje normal
+            } catch (e) {
+              this.logger.log(
+                `[${new Date().toISOString()}] Error requesting placeholder resync:`,
+                e
+              );
             }
           }
+
+          if (textToBody === "onDemandHistSync") {
+            try {
+              if (this.vendor.fetchMessageHistory) {
+                const messageId = await this.vendor.fetchMessageHistory(
+                  50,
+                  messageCtx.key,
+                  messageCtx.messageTimestamp
+                );
+                this.logger.log(
+                  `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
+                );
+              }
+              continue; // No procesar como mensaje normal
+            } catch (e) {
+              this.logger.log(
+                `[${new Date().toISOString()}] Error requesting history sync:`,
+                e
+              );
+            }
+          }
+
+          if ((messageCtx as any).requestId) {
+            this.logger.log(
+              `[${new Date().toISOString()}] Message received from phone, id=${(messageCtx as any).requestId
+              }`,
+              messageCtx
+            );
+          }
+        }
+
+        let payload = {
+          ...messageCtx,
+          body: textToBody,
+          name: messageCtx?.pushName,
+          from: messageCtx?.key?.remoteJid,
+        };
+
+        if (messageCtx.message?.locationMessage) {
+          const { degreesLatitude, degreesLongitude } =
+            messageCtx.message.locationMessage;
+          if (
+            typeof degreesLatitude === "number" &&
+            typeof degreesLongitude === "number"
+          ) {
+            payload = {
+              ...payload,
+              body: utils.generateRefProvider("_event_location_"),
+            };
+          }
+        }
+
+        if (messageCtx.message?.videoMessage) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_media_"),
+          };
+        }
+
+        if (messageCtx.message?.stickerMessage) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_media_"),
+          };
+        }
+
+        if (messageCtx.message?.imageMessage) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_media_"),
+          };
+        }
+
+        if (
+          messageCtx.message?.documentMessage ||
+          messageCtx.message?.documentWithCaptionMessage
+        ) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_document_"),
+          };
+        }
+
+        if (messageCtx.message?.audioMessage) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_voice_note_"),
+          };
+        }
+
+        if (messageCtx.message?.orderMessage) {
+          payload = {
+            ...payload,
+            body: utils.generateRefProvider("_event_order_"),
+          };
+        }
+
+        // status@broadcast son los "estados" de WhatsApp: descarte
+        // esperado y de alto volumen, no lo logueamos para no ahogar el log.
+        if (payload.from === "status@broadcast") continue;
+        payload.from = baileyCleanNumber(payload.from, true);
+
+        if (
+          this.globalVendorArgs.writeMyself === "none" &&
+          payload?.key?.fromMe
+        ) {
+          this.logDroppedMessage("write_myself_none", messageCtx);
+          continue;
+        }
+        if (
+          this.globalVendorArgs.host?.phone !== payload.from &&
+          payload?.key?.fromMe &&
+          !["both"].includes(this.globalVendorArgs.writeMyself)
+        ) {
+          this.logDroppedMessage("from_me_not_allowed", messageCtx, {
+            writeMyself: this.globalVendorArgs.writeMyself,
+          });
+          continue;
+        }
+        if (
+          this.globalVendorArgs.host?.phone === payload.from &&
+          !["both", "host"].includes(this.globalVendorArgs.writeMyself)
+        ) {
+          this.logDroppedMessage("host_message_not_allowed", messageCtx, {
+            writeMyself: this.globalVendorArgs.writeMyself,
+          });
+          continue;
+        }
+
+        if (!baileyIsValidNumber(payload.from)) {
+          this.logDroppedMessage("invalid_jid_or_group", messageCtx);
+          continue;
+        }
+
+        const btnCtx =
+          payload?.message?.buttonsResponseMessage?.selectedDisplayText;
+        if (btnCtx) payload.body = btnCtx;
+
+        const listRowId = payload?.message?.listResponseMessage?.title;
+        if (listRowId) payload.body = listRowId;
+
+        // El dedupe anterior guardaba solo 10 ids en un array y lo VACIABA
+        // entero al encontrar un duplicado (o al pasar de 10), asi que en la
+        // practica no deduplicaba y ademas olvidaba ids ya vistos. Ahora es
+        // un cache con TTL, que es lo que hace falta al procesar tambien los
+        // mensajes sincronizados tras una reconexion.
+        const isDuplicate = () => {
+          if (!messageCtx?.key?.id) return false;
+          const idWs = `${messageCtx.key.id}__${payload.from}`;
+          if (this.processedMessagesCache?.get(idWs)) return true;
+          this.processedMessagesCache?.set(idWs, true);
+          return false;
+        };
+
+        if (isDuplicate()) {
+          this.logDroppedMessage("duplicate", messageCtx, {
+            upsertType: type,
+          });
+          continue;
+        }
+
+        this.emit("message", payload);
+      }
+    };
+
+    return [
+      {
+        event: "messages.upsert",
+        func: handleMessagesUpsert,
+      },
+      {
+        // Baileys entrega por aca los mensajes que llegan por sincronizacion:
+        // enlace inicial, historial, y las respuestas a requestPlaceholderResend.
+        // El provider NO estaba suscrito, asi que todo eso era inalcanzable.
+        // Lo reenviamos al mismo handler (como "append") para reutilizar el
+        // filtro de antiguedad, la normalizacion y el dedupe.
+        event: "messaging-history.set",
+        func: async (arg) => {
+          const { messages, syncType, progress } = (arg || {}) as {
+            messages?: WAMessage[];
+            syncType?: unknown;
+            progress?: number | null;
+          };
+
+          this.logger.log(
+            `[${new Date().toISOString()}] [BAILEYS_HISTORY_SET] mensajes=${messages?.length ?? 0} syncType=${String(syncType)} progress=${String(progress)}`
+          );
+
+          if (!messages?.length) return;
+          await handleMessagesUpsert({ messages, type: "append" });
         },
       },
       {
@@ -760,6 +1006,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
         },
       },
     ];
+  };
 
   /**
    * @param {string} orderId
