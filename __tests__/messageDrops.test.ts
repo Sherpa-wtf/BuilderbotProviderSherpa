@@ -30,9 +30,19 @@ jest.mock('../src/baileyWrapper', () => ({
     })),
     makeWASocketOther: jest.fn().mockImplementation(() => ({
         ev: { on: jest.fn() },
-        authState: { creds: { registered: false } },
+        authState: { creds: { registered: true } },
+        // El provider envuelve sendMessage para cachear lo enviado; el mock
+        // devuelve un WebMessageInfo como haria Baileys.
+        sendMessage: jest.fn(async (jid: string, content: any) => ({
+            key: { remoteJid: jid, id: 'sent-1', fromMe: true },
+            message: { conversation: content?.text ?? 'enviado' },
+        })),
+        requestPlaceholderResend: jest.fn(async () => 'req-1'),
     })),
+    releaseTmp: jest.fn(),
 }))
+
+jest.mock('../src/releaseTmp', () => ({ releaseTmp: jest.fn() }))
 
 // wa-sticker-formatter arrastra `sharp` (binario nativo) y no hace falta aca.
 jest.mock('wa-sticker-formatter', () => ({
@@ -164,5 +174,120 @@ describe('#BaileysProvider ingesta de mensajes entrantes', () => {
     test('getMessage devuelve undefined (no un mensaje vacio) cuando no tenemos el original', async () => {
         const result = await provider.getMessage({ remoteJid: CONTACT_JID, id: 'desconocido' })
         expect(result).toBeUndefined()
+    })
+
+    // El history sync llega para TODOS los tipos, no solo los que pedimos.
+    // Procesar el que WhatsApp empuja significaria que al re-linkear un bot por
+    // QR la IA le contesta de golpe a todas las conversaciones recientes.
+    describe('history sync', () => {
+        test('procesa el que pedimos nosotros (ON_DEMAND)', async () => {
+            await historyHandler()({
+                messages: [textMessage()],
+                syncType: 6, // proto.HistorySync.HistorySyncType.ON_DEMAND
+            })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                'message',
+                expect.objectContaining({ body: 'Hola buenas noches' })
+            )
+        })
+
+        test('procesa cuando viene peerDataRequestSessionId aunque el syncType no diga ON_DEMAND', async () => {
+            await historyHandler()({
+                messages: [textMessage()],
+                syncType: 2,
+                peerDataRequestSessionId: 'sesion-1',
+            })
+
+            expect(provider.emit).toHaveBeenCalled()
+        })
+
+        test('IGNORA el historial que WhatsApp empuja solo (re-link por QR)', async () => {
+            await historyHandler()({
+                messages: [textMessage(), textMessage(), textMessage()],
+                syncType: 2, // RECENT: historial no pedido
+            })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+            expect(stdoutChunks.join('')).toContain('BAILEYS_HISTORY_SET_IGNORED')
+        })
+    })
+
+    describe('otras rutas de descarte (antes mudas)', () => {
+        test('"absent" pide reenvio', async () => {
+            const absent = textMessage({
+                message: null,
+                messageStubParameters: ['Message absent from node'],
+            })
+
+            await upsertHandler()({ type: 'notify', messages: [absent] })
+
+            expect(provider.vendor.requestPlaceholderResend).toHaveBeenCalledWith(absent.key)
+            expect(stdoutChunks.join('')).toContain('absent')
+        })
+
+        test('"Invalid" queda logueado', async () => {
+            const invalid = textMessage({
+                message: null,
+                messageStubParameters: ['Invalid session token'],
+            })
+
+            await upsertHandler()({ type: 'notify', messages: [invalid] })
+
+            expect(stdoutChunks.join('')).toContain('invalid_stub_parameter')
+        })
+
+        test('un mensaje propio (fromMe) con writeMyself "none" queda logueado', async () => {
+            const own = textMessage({
+                key: { remoteJid: CONTACT_JID, id: 'propio-1', fromMe: true },
+            })
+
+            await upsertHandler()({ type: 'notify', messages: [own] })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+            expect(stdoutChunks.join('')).toContain('write_myself_none')
+        })
+
+        test('un mensaje de grupo queda logueado y no se emite', async () => {
+            const { isJidGroup } = jest.requireMock('../src/baileyWrapper') as any
+            isJidGroup.mockReturnValueOnce(true)
+
+            const group = textMessage({
+                key: { remoteJid: '12345-67890@g.us', id: 'grupo-1', fromMe: false },
+            })
+
+            await upsertHandler()({ type: 'notify', messages: [group] })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+            expect(stdoutChunks.join('')).toContain('invalid_jid_or_group')
+        })
+
+        test('status@broadcast se ignora sin ensuciar el log', async () => {
+            const status = textMessage({
+                key: { remoteJid: 'status@broadcast', id: 'st-1', fromMe: false },
+            })
+
+            await upsertHandler()({ type: 'notify', messages: [status] })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+            expect(stdoutChunks.join('')).not.toContain('BAILEYS_MESSAGE_DROPPED')
+        })
+    })
+
+    // getMessage es lo que Baileys usa para reenviar cuando el peer no pudo
+    // desencriptar. Si el cache no se puebla, la sesion Signal queda desincronizada.
+    describe('cache de enviados', () => {
+        test('sendMessage puebla el cache y getMessage devuelve el original', async () => {
+            await provider.initVendor()
+
+            const sent = await provider.vendor.sendMessage(CONTACT_JID, { text: 'hola' })
+
+            const recovered = await provider.getMessage({
+                remoteJid: sent.key.remoteJid,
+                id: sent.key.id,
+            })
+
+            expect(recovered).toEqual(sent.message)
+        })
     })
 })

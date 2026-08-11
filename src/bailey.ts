@@ -56,6 +56,14 @@ const SYNCED_MESSAGE_MAX_AGE_SECONDS = Number(
   process.env.BAILEYS_SYNCED_MESSAGE_MAX_AGE_SECONDS || 6 * 60 * 60 // 6 horas
 );
 
+/**
+ * proto.HistorySync.HistorySyncType.ON_DEMAND. Es el unico history sync que
+ * procesamos: el que llega como respuesta a un pedido nuestro. El resto es
+ * historial que WhatsApp empuja solo (enlace inicial, bootstrap) y procesarlo
+ * haria que el bot conteste conversaciones viejas de golpe.
+ */
+const ON_DEMAND_HISTORY_SYNC_TYPE = 6;
+
 class BaileysProvider extends ProviderClass<WASocket> {
   public globalVendorArgs: BaileyGlobalVendorArgs = {
     name: `bot`,
@@ -414,8 +422,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // Baileys ("Bad MAC", "No session", "failed to decrypt"). Sin eso no habia
     // forma de saber que un mensaje entrante se habia perdido. pino escribe a
     // stdout, asi que ahora si llega al log del deploy.
+    // Estaba en "fatal", que silencia TODOS los errores de desencriptado de
+    // Baileys. Los fallos de desencriptado salen por logger.error
+    // (decode-wa-message.js: "failed to decrypt message"), asi que "error"
+    // alcanza para verlos sin sumar el volumen de warn, que en este log ya
+    // saturado acorta la ventana historica recuperable.
     const loggerBaileys = pino({
-      level: process.env.BAILEYS_LOG_LEVEL || "warn",
+      level: process.env.BAILEYS_LOG_LEVEL || "error",
     });
 
     this.saveCredsGlobal = saveCreds;
@@ -648,22 +661,26 @@ class BaileysProvider extends ProviderClass<WASocket> {
       if (type !== "notify") {
         const cutoffSeconds =
           Math.floor(Date.now() / 1000) - SYNCED_MESSAGE_MAX_AGE_SECONDS;
-        messagesToProcess = (messages || []).filter((m) => {
-          const timestamp = Number(m?.messageTimestamp ?? 0);
-          return !m?.key?.fromMe && timestamp >= cutoffSeconds;
-        });
+
+        // Una sola pasada: antes esto era un filter con includes adentro (O(n²)),
+        // y un history sync puede traer miles de mensajes.
+        messagesToProcess = [];
+        for (const candidate of messages || []) {
+          const timestamp = Number(candidate?.messageTimestamp ?? 0);
+          if (!candidate?.key?.fromMe && timestamp >= cutoffSeconds) {
+            messagesToProcess.push(candidate);
+          } else {
+            this.logDroppedMessage(
+              "synced_message_too_old_or_own",
+              candidate,
+              { upsertType: type }
+            );
+          }
+        }
 
         this.logger.log(
           `[${new Date().toISOString()}] [BAILEYS_UPSERT_SYNCED] type=${type} recibidos=${messages?.length ?? 0} recuperados=${messagesToProcess.length}`
         );
-
-        for (const skipped of (messages || []).filter(
-          (m) => !messagesToProcess.includes(m)
-        )) {
-          this.logDroppedMessage("synced_message_too_old_or_own", skipped, {
-            upsertType: type,
-          });
-        }
 
         if (!messagesToProcess.length) return;
       }
@@ -931,24 +948,45 @@ class BaileysProvider extends ProviderClass<WASocket> {
         func: handleMessagesUpsert,
       },
       {
-        // Baileys entrega por aca los mensajes que llegan por sincronizacion:
-        // enlace inicial, historial, y las respuestas a requestPlaceholderResend.
-        // El provider NO estaba suscrito, asi que todo eso era inalcanzable.
-        // Lo reenviamos al mismo handler (como "append") para reutilizar el
-        // filtro de antiguedad, la normalizacion y el dedupe.
+        // Baileys entrega por aca TODOS los history sync: el enlace inicial, el
+        // historial que WhatsApp empuja solo, y las respuestas a los pedidos que
+        // hacemos nosotros (requestPlaceholderResend / fetchMessageHistory).
+        //
+        // Solo procesamos los ULTIMOS. Procesar el historial que WhatsApp empuja
+        // significaria que, al re-linkear un bot por QR, la IA le contesta de
+        // golpe a todas las conversaciones recientes: mensajes reales a clientes
+        // reales. El unico caso que necesitamos es cerrar el loop de un reenvio
+        // que pedimos por un mensaje que no pudimos desencriptar.
         event: "messaging-history.set",
         func: async (arg) => {
-          const { messages, syncType, progress } = (arg || {}) as {
+          const { messages, syncType, progress, peerDataRequestSessionId } = (arg ||
+            {}) as {
             messages?: WAMessage[];
             syncType?: unknown;
             progress?: number | null;
+            peerDataRequestSessionId?: string | null;
           };
 
+          // ON_DEMAND es el syncType de lo que pedimos nosotros;
+          // peerDataRequestSessionId viene seteado en esas mismas respuestas.
+          const isOnDemand =
+            String(syncType) === String(ON_DEMAND_HISTORY_SYNC_TYPE) ||
+            String(syncType).toUpperCase() === "ON_DEMAND" ||
+            Boolean(peerDataRequestSessionId);
+
           this.logger.log(
-            `[${new Date().toISOString()}] [BAILEYS_HISTORY_SET] mensajes=${messages?.length ?? 0} syncType=${String(syncType)} progress=${String(progress)}`
+            `[${new Date().toISOString()}] [BAILEYS_HISTORY_SET] mensajes=${messages?.length ?? 0} syncType=${String(syncType)} onDemand=${isOnDemand} progress=${String(progress)}`
           );
 
           if (!messages?.length) return;
+
+          if (!isOnDemand) {
+            this.logger.log(
+              `[${new Date().toISOString()}] [BAILEYS_HISTORY_SET_IGNORED] ${messages.length} mensajes de historial no pedido; no se procesan para no responder conversaciones viejas`
+            );
+            return;
+          }
+
           await handleMessagesUpsert({ messages, type: "append" });
         },
       },
