@@ -1,6 +1,6 @@
 {
   "name": "builderbot-provider-sherpa",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Sherpa provider for Builderbot",
   "keywords": [
     "builderbot",
@@ -75,7 +75,7 @@
     "@adiwajshing/keyed-db": "^0.2.4",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@types/polka": "^0.5.7",
-    "baileys": "7.0.0-rc10",
+    "baileys": "7.0.0-rc14",
     "fluent-ffmpeg": "^2.1.2",
     "fs-extra": "^11.2.0",
     "jimp": "^1.6.0",

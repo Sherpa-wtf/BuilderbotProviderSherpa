@@ -5,7 +5,7 @@ import type {
   SendOptions,
 } from "@builderbot/bot/dist/types";
 import type { Boom } from "@hapi/boom";
-import { WAVersion, WABrowserDescription } from "baileys";
+import { WABrowserDescription } from "baileys";
 import { Console } from "console";
 import type { PathOrFileDescriptor } from "fs";
 import { createReadStream, createWriteStream, readFileSync } from "fs";
@@ -293,7 +293,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
     try {
       const sock = makeWASocketOther({
         logger: loggerBaileys,
-        version: [2, 3000, 1023223821] as WAVersion,
         printQRInTerminal: false,
         auth: {
           creds: state.creds,
