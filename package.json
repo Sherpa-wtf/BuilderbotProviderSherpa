@@ -1,6 +1,6 @@
 {
   "name": "builderbot-provider-sherpa",
-  "version": "0.1.5",
+  "version": "0.1.6-beta.0",
   "description": "Sherpa provider for Builderbot",
   "keywords": [
     "builderbot",
