@@ -1247,6 +1247,25 @@ describe('#BaileysProvider', () => {
     })
 
     describe('#initVendor', () => {
+        test('opens offline replay for a linked identity even when Baileys reports registered=false', async () => {
+            ;(useMultiFileAuthState as jest.MockedFunction<typeof useMultiFileAuthState>).mockResolvedValueOnce({
+                state: {
+                    creds: {
+                        registered: false,
+                        me: { id: '1234567890:1@s.whatsapp.net', name: 'test-bot' },
+                    },
+                    keys: {},
+                } as any,
+                saveCreds: jest.fn(async () => undefined),
+            })
+            provider.globalVendorArgs.offlineReplayEnabled = true
+            const openReplaySpy = jest.spyOn(provider['offlineReplayWindow'], 'open')
+
+            await provider['initVendor']()
+
+            expect(openReplaySpy).toHaveBeenCalledWith(true)
+        })
+
         test('should initialize when useBaileysStore is true', async () => {
             // Arrange
             jest.spyOn(fs, 'existsSync').mockReturnValueOnce(true)
