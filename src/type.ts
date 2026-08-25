@@ -10,6 +10,7 @@ export interface BaileyGlobalVendorArgs extends GlobalVendorArgs {
     useBaileysStore: boolean
     timeRelease?: number
     experimentalStore?: boolean
+    offlineReplayEnabled?: boolean
     groupsIgnore: boolean
     readStatus: boolean
     version?: WAVersion //

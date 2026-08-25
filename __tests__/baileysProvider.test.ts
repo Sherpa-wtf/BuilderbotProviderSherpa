@@ -6,6 +6,7 @@ import fs from 'fs'
 import mime from 'mime-types'
 import { utils } from '@builderbot/bot'
 import { useMultiFileAuthState } from '../src/baileyWrapper'
+import { OFFLINE_REPLAY_MESSAGE_EVENT } from '../src/offlineReplay'
 const phoneNumber = '+123456789'
 
 jest.mock('../src/baileyWrapper', () => ({
@@ -105,6 +106,7 @@ describe('#BaileysProvider', () => {
             autoRefresh: 0,
             writeMyself: 'none',
             experimentalStore: false,
+            offlineReplayEnabled: false,
             experimentalSyncMessage: undefined,
         }
         // Act
@@ -760,6 +762,98 @@ describe('#BaileysProvider', () => {
     })
 
     describe('#busEvents - messages.upsert ', () => {
+        test('routes append messages to offline replay without emitting a normal message', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'offline-1',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_000,
+                message: { conversation: 'offline message' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'append' })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({
+                    messageId: 'offline-1',
+                    sequence: 1,
+                    message: mockMessage,
+                })
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
+        test('ignores append messages when there is no registered-session replay window', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            await provider['busEvents']()[0].func({
+                messages: [
+                    {
+                        key: {
+                            id: 'history-1',
+                            remoteJid: '1234567890@s.whatsapp.net',
+                            fromMe: false,
+                        },
+                        message: { conversation: 'old history' },
+                    },
+                ],
+                type: 'append',
+            })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+        })
+
+        test('gates live notify traffic behind an open replay window', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'live-during-replay',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_001,
+                message: { conversation: 'live message' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'notify' })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'live-during-replay', upsertType: 'notify' }),
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
+        test('consumes duplicate notify traffic while a replay window is active', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'same-offline-id',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_001,
+                message: { conversation: 'offline duplicate' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'append' })
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'notify' })
+
+            expect(provider.emit).toHaveBeenCalledTimes(1)
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'same-offline-id', upsertType: 'append' }),
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
         test('Should return undefine if the type is different from notify', async () => {
             // Arrange
             const message = {

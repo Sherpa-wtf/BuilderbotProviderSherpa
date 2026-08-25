@@ -37,6 +37,7 @@ import {
   useMultiFileAuthState,
 } from "./baileyWrapper";
 import { releaseTmp } from "./releaseTmp";
+import { OfflineReplayWindow } from "./offlineReplay";
 import type { BaileyGlobalVendorArgs } from "./type";
 import {
   baileyGenerateImage,
@@ -63,6 +64,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     groupsIgnore: true,
     readStatus: false,
     experimentalStore: false,
+    offlineReplayEnabled: false,
     autoRefresh: 0,
     experimentalSyncMessage: undefined,
     fallBackAction: undefined,
@@ -80,9 +82,14 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
   private idsDuplicates = [];
   private mapSet = new Set();
+  private readonly offlineReplayWindow: OfflineReplayWindow;
 
   constructor(args: Partial<BaileyGlobalVendorArgs>) {
     super();
+
+    this.offlineReplayWindow = new OfflineReplayWindow((event, payload) =>
+      this.emit(event, payload)
+    );
 
     this.logStream = createWriteStream(`${process.cwd()}/baileys.log`, {
       flags: "a",
@@ -275,6 +282,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
   protected initVendor = async () => {
     const NAME_DIR_SESSION = `${this.globalVendorArgs.name}_sessions`;
     const { state, saveCreds } = await useMultiFileAuthState(NAME_DIR_SESSION);
+    this.offlineReplayWindow.open(
+      Boolean(state.creds.registered) &&
+      this.globalVendorArgs.offlineReplayEnabled === true
+    );
     const loggerBaileys = pino({ level: "fatal" });
 
     this.saveCredsGlobal = saveCreds;
@@ -350,8 +361,18 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
       sock.ev.on(
         "connection.update",
-        async (update: { connection: any; lastDisconnect: any; qr: any }) => {
-          const { connection, lastDisconnect, qr } = update;
+        async (update: {
+          connection: any;
+          lastDisconnect: any;
+          qr: any;
+          receivedPendingNotifications?: boolean;
+        }) => {
+          const {
+            connection,
+            lastDisconnect,
+            qr,
+            receivedPendingNotifications,
+          } = update;
 
           this.logger.log(
             `[${new Date().toISOString()}] Connection update: ${connection}`
@@ -415,6 +436,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
             this.emit("host", host);
           }
 
+          if (receivedPendingNotifications === true) {
+            this.offlineReplayWindow.complete();
+          }
+
           /** QR Code */
           if (qr && !this.globalVendorArgs.usePairingCode) {
             this.logger.log(`[${new Date().toISOString()}] QR Code received`);
@@ -467,6 +492,14 @@ class BaileysProvider extends ProviderClass<WASocket> {
             type: MessageUpsertType;
             messages: WAMessage[];
           };
+          if (type === "append") {
+            for (const message of messages || []) {
+              if (message?.key?.fromMe) continue;
+              if (!message?.key?.id) continue;
+              this.offlineReplayWindow.capture(message, "append");
+            }
+            return;
+          }
           if (type !== "notify") return;
 
           const pingMessageSync = async (_messageCtx: proto.IWebMessageInfo) => {
@@ -486,6 +519,15 @@ class BaileysProvider extends ProviderClass<WASocket> {
           };
 
           for (const messageCtx of messages) {
+            if (
+              this.offlineReplayWindow.isActive() &&
+              !messageCtx?.key?.fromMe
+            ) {
+              if (messageCtx?.key?.id) {
+                this.offlineReplayWindow.capture(messageCtx, "notify");
+              }
+              continue;
+            }
             if (
               messageCtx?.messageStubParameters?.length &&
               messageCtx.messageStubParameters[0].includes("absent")
