@@ -106,6 +106,7 @@ describe('#BaileysProvider', () => {
             autoRefresh: 0,
             writeMyself: 'none',
             experimentalStore: false,
+            offlineReplayEnabled: false,
             experimentalSyncMessage: undefined,
         }
         // Act

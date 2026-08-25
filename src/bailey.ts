@@ -64,6 +64,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     groupsIgnore: true,
     readStatus: false,
     experimentalStore: false,
+    offlineReplayEnabled: false,
     autoRefresh: 0,
     experimentalSyncMessage: undefined,
     fallBackAction: undefined,
@@ -281,7 +282,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
   protected initVendor = async () => {
     const NAME_DIR_SESSION = `${this.globalVendorArgs.name}_sessions`;
     const { state, saveCreds } = await useMultiFileAuthState(NAME_DIR_SESSION);
-    this.offlineReplayWindow.open(Boolean(state.creds.registered));
+    this.offlineReplayWindow.open(
+      Boolean(state.creds.registered) &&
+      this.globalVendorArgs.offlineReplayEnabled === true
+    );
     const loggerBaileys = pino({ level: "fatal" });
 
     this.saveCredsGlobal = saveCreds;
