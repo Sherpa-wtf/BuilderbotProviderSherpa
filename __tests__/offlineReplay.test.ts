@@ -7,6 +7,11 @@ import {
 } from '../src/offlineReplay'
 
 describe('OfflineReplayWindow', () => {
+    test('publishes the documented replay event names', () => {
+        expect(OFFLINE_REPLAY_MESSAGE_EVENT).toBe('offline.replay.message')
+        expect(OFFLINE_REPLAY_COMPLETE_EVENT).toBe('offline.replay.complete')
+    })
+
     test('ignores append traffic for a brand-new unregistered session', () => {
         const emit = jest.fn()
         const replay = new OfflineReplayWindow(emit, () => 1_000)

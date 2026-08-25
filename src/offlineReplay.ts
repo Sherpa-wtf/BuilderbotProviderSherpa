@@ -2,8 +2,8 @@ import { randomUUID } from 'crypto'
 
 import type { WAMessage } from './baileyWrapper'
 
-export const OFFLINE_REPLAY_MESSAGE_EVENT = 'offline_replay_message'
-export const OFFLINE_REPLAY_COMPLETE_EVENT = 'offline_replay_complete'
+export const OFFLINE_REPLAY_MESSAGE_EVENT = 'offline.replay.message'
+export const OFFLINE_REPLAY_COMPLETE_EVENT = 'offline.replay.complete'
 
 export interface OfflineReplayWindowState {
     windowId: string
