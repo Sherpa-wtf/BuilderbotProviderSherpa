@@ -6,6 +6,7 @@ import fs from 'fs'
 import mime from 'mime-types'
 import { utils } from '@builderbot/bot'
 import { useMultiFileAuthState } from '../src/baileyWrapper'
+import { OFFLINE_REPLAY_MESSAGE_EVENT } from '../src/offlineReplay'
 const phoneNumber = '+123456789'
 
 jest.mock('../src/baileyWrapper', () => ({
@@ -760,6 +761,51 @@ describe('#BaileysProvider', () => {
     })
 
     describe('#busEvents - messages.upsert ', () => {
+        test('routes append messages to offline replay without emitting a normal message', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'offline-1',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_000,
+                message: { conversation: 'offline message' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'append' })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({
+                    messageId: 'offline-1',
+                    sequence: 1,
+                    message: mockMessage,
+                })
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
+        test('ignores append messages when there is no registered-session replay window', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            await provider['busEvents']()[0].func({
+                messages: [
+                    {
+                        key: {
+                            id: 'history-1',
+                            remoteJid: '1234567890@s.whatsapp.net',
+                            fromMe: false,
+                        },
+                        message: { conversation: 'old history' },
+                    },
+                ],
+                type: 'append',
+            })
+
+            expect(provider.emit).not.toHaveBeenCalled()
+        })
+
         test('Should return undefine if the type is different from notify', async () => {
             // Arrange
             const message = {
