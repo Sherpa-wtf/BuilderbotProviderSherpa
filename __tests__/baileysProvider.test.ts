@@ -829,6 +829,31 @@ describe('#BaileysProvider', () => {
             expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
         })
 
+        test('consumes duplicate notify traffic while a replay window is active', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'same-offline-id',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_001,
+                message: { conversation: 'offline duplicate' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'append' })
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'notify' })
+
+            expect(provider.emit).toHaveBeenCalledTimes(1)
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'same-offline-id', upsertType: 'append' }),
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
         test('Should return undefine if the type is different from notify', async () => {
             // Arrange
             const message = {

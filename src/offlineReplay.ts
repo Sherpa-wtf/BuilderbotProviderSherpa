@@ -58,6 +58,10 @@ export class OfflineReplayWindow {
         return { ...this.active }
     }
 
+    isActive(): boolean {
+        return this.active !== null
+    }
+
     capture(message: WAMessage, upsertType: 'append' | 'notify' = 'append'): boolean {
         if (!this.active) return false
 

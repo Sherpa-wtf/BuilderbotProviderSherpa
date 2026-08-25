@@ -520,10 +520,12 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
           for (const messageCtx of messages) {
             if (
-              !messageCtx?.key?.fromMe &&
-              messageCtx?.key?.id &&
-              this.offlineReplayWindow.capture(messageCtx, "notify")
+              this.offlineReplayWindow.isActive() &&
+              !messageCtx?.key?.fromMe
             ) {
+              if (messageCtx?.key?.id) {
+                this.offlineReplayWindow.capture(messageCtx, "notify");
+              }
               continue;
             }
             if (
