@@ -18,7 +18,7 @@ export interface OfflineReplayMessageEvent {
     sequence: number
     messageId: string | null
     messageTimestamp: number | null
-    upsertType: 'append' | 'notify'
+    upsertType: 'append' | 'notify' | 'history'
     message: WAMessage
 }
 
@@ -62,7 +62,7 @@ export class OfflineReplayWindow {
         return this.active !== null
     }
 
-    capture(message: WAMessage, upsertType: 'append' | 'notify' = 'append'): boolean {
+    capture(message: WAMessage, upsertType: 'append' | 'notify' | 'history' = 'append'): boolean {
         if (!this.active) return false
 
         const messageId = message?.key?.id ?? null

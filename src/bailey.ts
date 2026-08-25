@@ -520,6 +520,42 @@ class BaileysProvider extends ProviderClass<WASocket> {
           };
 
           for (const messageCtx of messages) {
+            const textToBody =
+              messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
+                ?.text ??
+              messageCtx?.message?.extendedTextMessage?.text ??
+              messageCtx?.message?.conversation;
+
+            // This control message must run before the replay gate. Otherwise a
+            // reconnect window consumes it as normal replay traffic and the
+            // history request is never sent.
+            if (textToBody === "onDemandHistSync") {
+              try {
+                if (this.vendor.fetchMessageHistory) {
+                  this.offlineReplayWindow.open(true);
+                  const messageId = await this.vendor.fetchMessageHistory(
+                    50,
+                    messageCtx.key,
+                    messageCtx.messageTimestamp
+                  );
+                  this.logger.log(
+                    `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
+                  );
+                } else {
+                  this.logger.log(
+                    `[${new Date().toISOString()}] On-demand history sync is unavailable`
+                  );
+                }
+              } catch (e) {
+                this.offlineReplayWindow.complete();
+                this.logger.log(
+                  `[${new Date().toISOString()}] Error requesting history sync:`,
+                  e
+                );
+              }
+              continue;
+            }
+
             if (
               this.offlineReplayWindow.isActive() &&
               !messageCtx?.key?.fromMe
@@ -570,12 +606,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
             }
             // if (((messageCtx?.message?.protocolMessage?.type) as unknown as string) === 'EPHEMERAL_SETTING') continue
 
-            const textToBody =
-              messageCtx?.message?.ephemeralMessage?.message?.extendedTextMessage
-                ?.text ??
-              messageCtx?.message?.extendedTextMessage?.text ??
-              messageCtx?.message?.conversation;
-
             if (textToBody) {
               if (
                 textToBody === "requestPlaceholder" &&
@@ -594,27 +624,6 @@ class BaileysProvider extends ProviderClass<WASocket> {
                 } catch (e) {
                   this.logger.log(
                     `[${new Date().toISOString()}] Error requesting placeholder resync:`,
-                    e
-                  );
-                }
-              }
-
-              if (textToBody === "onDemandHistSync") {
-                try {
-                  if (this.vendor.fetchMessageHistory) {
-                    const messageId = await this.vendor.fetchMessageHistory(
-                      50,
-                      messageCtx.key,
-                      messageCtx.messageTimestamp
-                    );
-                    this.logger.log(
-                      `[${new Date().toISOString()}] Requested on-demand sync, id=${messageId}`
-                    );
-                  }
-                  continue; // No procesar como mensaje normal
-                } catch (e) {
-                  this.logger.log(
-                    `[${new Date().toISOString()}] Error requesting history sync:`,
                     e
                   );
                 }
@@ -746,6 +755,18 @@ class BaileysProvider extends ProviderClass<WASocket> {
               this.emit("message", payload);
             }
           }
+        },
+      },
+      {
+        event: "messaging-history.set",
+        func: async (history) => {
+          const { messages = [] } = history as { messages?: WAMessage[] };
+          for (const message of messages) {
+            if (message?.key?.fromMe) continue;
+            if (!message?.key?.id) continue;
+            this.offlineReplayWindow.capture(message, "history");
+          }
+          this.offlineReplayWindow.complete();
         },
       },
       {
