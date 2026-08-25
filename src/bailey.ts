@@ -492,7 +492,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
             for (const message of messages || []) {
               if (message?.key?.fromMe) continue;
               if (!message?.key?.id) continue;
-              this.offlineReplayWindow.capture(message);
+              this.offlineReplayWindow.capture(message, "append");
             }
             return;
           }
@@ -515,6 +515,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
           };
 
           for (const messageCtx of messages) {
+            if (
+              !messageCtx?.key?.fromMe &&
+              messageCtx?.key?.id &&
+              this.offlineReplayWindow.capture(messageCtx, "notify")
+            ) {
+              continue;
+            }
             if (
               messageCtx?.messageStubParameters?.length &&
               messageCtx.messageStubParameters[0].includes("absent")

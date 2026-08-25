@@ -806,6 +806,28 @@ describe('#BaileysProvider', () => {
             expect(provider.emit).not.toHaveBeenCalled()
         })
 
+        test('gates live notify traffic behind an open replay window', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            provider['offlineReplayWindow'].open(true)
+            const mockMessage = {
+                key: {
+                    id: 'live-during-replay',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_001,
+                message: { conversation: 'live message' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [mockMessage], type: 'notify' })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'live-during-replay', upsertType: 'notify' }),
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
         test('Should return undefine if the type is different from notify', async () => {
             // Arrange
             const message = {

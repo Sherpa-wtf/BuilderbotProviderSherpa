@@ -23,7 +23,7 @@ describe('OfflineReplayWindow', () => {
         const replay = new OfflineReplayWindow(emit, () => 1_000)
 
         const window = replay.open(true)
-        replay.capture({ key: { id: 'm-1' }, messageTimestamp: 995 } as any)
+        replay.capture({ key: { id: 'm-1' }, messageTimestamp: 995 } as any, 'append')
         replay.capture({ key: { id: 'm-2' }, messageTimestamp: 996 } as any)
 
         expect(emit).toHaveBeenNthCalledWith(
@@ -34,6 +34,7 @@ describe('OfflineReplayWindow', () => {
                 reconnectStartedAt: 1_000,
                 sequence: 1,
                 messageId: 'm-1',
+                upsertType: 'append',
             })
         )
         expect(emit).toHaveBeenNthCalledWith(
