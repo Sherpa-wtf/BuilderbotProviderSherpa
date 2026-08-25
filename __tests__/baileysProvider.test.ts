@@ -6,7 +6,10 @@ import fs from 'fs'
 import mime from 'mime-types'
 import { utils } from '@builderbot/bot'
 import { useMultiFileAuthState } from '../src/baileyWrapper'
-import { OFFLINE_REPLAY_MESSAGE_EVENT } from '../src/offlineReplay'
+import {
+    OFFLINE_REPLAY_COMPLETE_EVENT,
+    OFFLINE_REPLAY_MESSAGE_EVENT,
+} from '../src/offlineReplay'
 const phoneNumber = '+123456789'
 
 jest.mock('../src/baileyWrapper', () => ({
@@ -762,6 +765,79 @@ describe('#BaileysProvider', () => {
     })
 
     describe('#busEvents - messages.upsert ', () => {
+        test('starts an explicit replay window before requesting on-demand history', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            const fetchMessageHistory = jest
+                .fn<() => Promise<string>>()
+                .mockResolvedValue('history-request-1')
+            provider.vendor = { fetchMessageHistory } as any
+            provider['offlineReplayWindow'].open(true)
+            const controlMessage = {
+                key: {
+                    id: 'history-control-1',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_100,
+                message: { conversation: 'onDemandHistSync' },
+            }
+
+            await provider['busEvents']()[0].func({ messages: [controlMessage], type: 'notify' })
+
+            expect(fetchMessageHistory).toHaveBeenCalledWith(
+                50,
+                controlMessage.key,
+                controlMessage.messageTimestamp,
+            )
+            expect(provider['offlineReplayWindow'].isActive()).toBe(true)
+            expect(provider.emit).not.toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'history-control-1' }),
+            )
+            expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+        })
+
+        test('routes on-demand history-set messages through replay and completes the window', async () => {
+            ;(provider.emit as jest.Mock).mockClear()
+            provider['offlineReplayWindow'].open(true)
+            const historyMessage = {
+                key: {
+                    id: 'history-result-1',
+                    remoteJid: '1234567890@s.whatsapp.net',
+                    fromMe: false,
+                },
+                messageTimestamp: 1_050,
+                message: { conversation: 'recovered message' },
+            }
+            const historyEvent = provider['busEvents']().find(
+                ({ event }) => event === 'messaging-history.set',
+            )
+
+            await historyEvent?.func({
+                messages: [
+                    historyMessage,
+                    {
+                        key: { id: 'history-from-me', fromMe: true },
+                        message: { conversation: 'ignore me' },
+                    },
+                ],
+                syncType: 7,
+            })
+
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({
+                    messageId: 'history-result-1',
+                    upsertType: 'history',
+                }),
+            )
+            expect(provider.emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_COMPLETE_EVENT,
+                expect.objectContaining({ messageCount: 1 }),
+            )
+            expect(provider['offlineReplayWindow'].isActive()).toBe(false)
+        })
+
         test('routes append messages to offline replay without emitting a normal message', async () => {
             ;(provider.emit as jest.Mock).mockClear()
             provider['offlineReplayWindow'].open(true)
