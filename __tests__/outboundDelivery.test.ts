@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, jest, test } from '@jest/globals'
+import { Sticker } from 'wa-sticker-formatter'
 import { BaileysProvider } from '../src'
 
 jest.mock('../src/baileyWrapper', () => ({
@@ -53,6 +54,7 @@ describe('BaileysProvider durable outbound primitives', () => {
         expect(sendMessage.mock.calls[0][2]).toEqual({
             messageId: '3EB0AAAAAAAAAAAAAAAAAA',
         })
+        expect(sendMessage.mock.calls[0][1]).toEqual({ text: 'hola' })
         expect(sendMessage.mock.calls[1]).toHaveLength(2)
     })
 
@@ -141,6 +143,40 @@ describe('BaileysProvider durable outbound primitives', () => {
         expect(sendMessage.mock.calls[0][2]).toEqual({
             quoted: { key: { id: 'quoted' } },
             messageId: '3EB0LOCATIONLOCATIONLO',
+        })
+        expect(sendMessage.mock.calls[0][1]).toEqual({
+            location: {
+                degreesLatitude: -34.6,
+                degreesLongitude: -58.4,
+            },
+        })
+        expect(sendMessage.mock.calls[1][1]).toEqual({
+            contacts: {
+                displayName: '.',
+                contacts: [{
+                    vcard: [
+                        'BEGIN:VCARD',
+                        'VERSION:3.0',
+                        'FN:Ada',
+                        'ORG:Sherpa;',
+                        'TEL;type=CELL;type=VOICE;waid=5491111111111:+5491111111111',
+                        'END:VCARD',
+                    ].join('\n'),
+                }],
+            },
+        })
+        expect(sendMessage.mock.calls[1][2]).toEqual({
+            quoted: null,
+            messageId: '3EB0CONTACTCONTACTCONT',
+        })
+        expect(Sticker).toHaveBeenCalledWith(Buffer.from('image'), {
+            quality: 50,
+            type: 'crop',
+        })
+        expect(sendMessage.mock.calls[2][1]).toEqual({ sticker: Buffer.from('sticker') })
+        expect(sendMessage.mock.calls[2][2]).toEqual({
+            quoted: null,
+            messageId: '3EB0STICKERSTICKERSTI',
         })
     })
 
@@ -250,6 +286,16 @@ describe('BaileysProvider durable outbound primitives', () => {
         ;(provider.emit as jest.Mock).mockClear()
         await handler([
             {
+                key: { id: '3EB0MALFORMEDERRORMALF', fromMe: true },
+                update: { status: 0, messageStubParameters: { invalid: true } },
+            },
+        ])
+
+        expect((provider.emit as jest.Mock).mock.calls[0][1]).not.toHaveProperty('error')
+
+        ;(provider.emit as jest.Mock).mockClear()
+        await handler([
+            {
                 key: { id: '3EB0NONERRORNONERRORNON', fromMe: true },
                 update: {
                     status: 2,
@@ -271,6 +317,7 @@ describe('BaileysProvider durable outbound primitives', () => {
             { key: undefined, update: { status: 2 } },
             { key: { id: '', fromMe: true }, update: { status: 2 } },
             { key: { id: '3EB0NOSTATUSNOSTATUSNO', fromMe: true }, update: {} },
+            { key: { id: '3EB0NULLSTATUSNULLSTATU', fromMe: true }, update: { status: null } },
             { key: { id: '3EB0NANSTATUSNANSTATUS', fromMe: true }, update: { status: 'not-a-number' } },
         ])
 

@@ -836,7 +836,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
         event: "messages.update",
         func: async (message) => {
           for (const { key, update } of message) {
-            const status = Number(update.status);
+            const status = update.status as number;
             if (key?.id && Number.isFinite(status)) {
               const stage = BAILEYS_STATUS_STAGE[status] || "unknown";
               const error = stage === "error" ? statusErrorEvidence(update) : undefined;
