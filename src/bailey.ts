@@ -1160,8 +1160,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     latitude: any,
     longitude: any,
     messages: any = null
-  ) => {
-    return this.sendVendorMessage(
+  ): Promise<any> => {
+    const response = await this.sendVendorMessage(
       remoteJid,
       {
         location: {
@@ -1171,6 +1171,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       },
       { quoted: messages }
     );
+    return this.outboundMessageId.getStore() ? response : { status: "success" };
   };
 
   /**
@@ -1188,7 +1189,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     displayName: string,
     orgName: string,
     messages: any = null
-  ) => {
+  ): Promise<any> => {
     const cleanContactNumber = contactNumber.replaceAll(" ", "");
     const waid = cleanContactNumber.replace("+", "");
 
@@ -1200,7 +1201,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       `TEL;type=CELL;type=VOICE;waid=${waid}:${cleanContactNumber}\n` +
       "END:VCARD";
 
-    return this.sendVendorMessage(
+    const response = await this.sendVendorMessage(
       remoteJid,
       {
         contacts: {
@@ -1210,6 +1211,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       },
       { quoted: messages }
     );
+    return this.outboundMessageId.getStore() ? response : { status: "success" };
   };
 
   /**

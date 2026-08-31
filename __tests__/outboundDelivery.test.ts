@@ -81,13 +81,23 @@ describe('BaileysProvider durable outbound primitives', () => {
         })
     })
 
-    test('preserves helper options outside a deterministic id context', async () => {
+    test('preserves legacy helper results and options outside a deterministic id context', async () => {
         const quoted = { key: { id: 'quoted-without-context' } }
 
-        await provider.sendLocation('plain-location@s.whatsapp.net', -34.6, -58.4, quoted)
+        const location = await provider.sendLocation('plain-location@s.whatsapp.net', -34.6, -58.4, quoted)
+        const contact = await provider.sendContact(
+            'plain-contact@s.whatsapp.net',
+            '+54 9 11 1111 1111' as any,
+            'Ada',
+            'Sherpa',
+        )
 
+        expect(location).toEqual({ status: 'success' })
+        expect(contact).toEqual({ status: 'success' })
         expect(sendMessage.mock.calls[0][2]).toEqual({ quoted })
         expect(sendMessage.mock.calls[0][2]).not.toHaveProperty('messageId')
+        expect(sendMessage.mock.calls[1][2]).toEqual({ quoted: null })
+        expect(sendMessage.mock.calls[1][2]).not.toHaveProperty('messageId')
     })
 
     test('isolates concurrent and nested messageId contexts', async () => {
