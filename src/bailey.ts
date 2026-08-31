@@ -5,6 +5,7 @@ import type {
   SendOptions,
 } from "@builderbot/bot/dist/types";
 import type { Boom } from "@hapi/boom";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { WABrowserDescription } from "baileys";
 import { Console } from "console";
 import type { PathOrFileDescriptor } from "fs";
@@ -46,6 +47,61 @@ import {
   emptyDirSessions,
 } from "./utils";
 
+export type BaileysMessageStatusStage =
+  | "error"
+  | "pending"
+  | "server_ack"
+  | "delivery_ack"
+  | "read"
+  | "played"
+  | "unknown";
+
+export interface BaileysMessageStatusEvent {
+  provider: "baileys";
+  providerMessageId: string;
+  remoteJid?: string | null;
+  fromMe?: boolean | null;
+  status: number;
+  stage: BaileysMessageStatusStage;
+  observedAt: string;
+  error?: Record<string, unknown>;
+}
+
+const BAILEYS_STATUS_STAGE: Record<number, BaileysMessageStatusStage> = {
+  0: "error",
+  1: "pending",
+  2: "server_ack",
+  3: "delivery_ack",
+  4: "read",
+  5: "played",
+};
+
+const boundedString = (value: unknown): string | undefined => {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const normalized = String(value).trim();
+  return normalized ? normalized.slice(0, 512) : undefined;
+};
+
+const statusErrorEvidence = (update: any): Record<string, unknown> | undefined => {
+  const evidence: Record<string, unknown> = {};
+  if (Array.isArray(update.messageStubParameters)) {
+    const messageStubParameters = update.messageStubParameters
+      .slice(0, 10)
+      .map(boundedString)
+      .filter(Boolean);
+    if (messageStubParameters.length > 0) {
+      evidence.messageStubParameters = messageStubParameters;
+    }
+  }
+  const code = boundedString(update.error?.code ?? update.code);
+  const name = boundedString(update.error?.name);
+  const message = boundedString(update.error?.message ?? update.message);
+  if (code) evidence.code = code;
+  if (name) evidence.name = name;
+  if (message) evidence.message = message;
+  return Object.keys(evidence).length > 0 ? evidence : undefined;
+};
+
 class BaileysProvider extends ProviderClass<WASocket> {
   public globalVendorArgs: BaileyGlobalVendorArgs = {
     name: `bot`,
@@ -73,6 +129,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectDelay = 1000; // 1 segundo inicial
+
+  /**
+   * Contexto por envio. Baileys permite fijar el messageId antes de enviar,
+   * pero Builderbot no expone esa opcion en sus helpers de alto nivel.
+   * AsyncLocalStorage evita compartir el id entre envios concurrentes.
+   */
+  private readonly outboundMessageId = new AsyncLocalStorage<string>();
 
   msgRetryCounterCache?: NodeCache;
   userDevicesCache?: NodeCache;
@@ -773,6 +836,22 @@ class BaileysProvider extends ProviderClass<WASocket> {
         event: "messages.update",
         func: async (message) => {
           for (const { key, update } of message) {
+            const status = update.status as number;
+            if (key?.id && Number.isFinite(status)) {
+              const stage = BAILEYS_STATUS_STAGE[status] || "unknown";
+              const error = stage === "error" ? statusErrorEvidence(update) : undefined;
+              const payload: BaileysMessageStatusEvent = {
+                provider: "baileys",
+                providerMessageId: key.id,
+                remoteJid: key.remoteJid ?? null,
+                fromMe: key.fromMe ?? null,
+                status,
+                stage,
+                observedAt: new Date().toISOString(),
+                ...(error ? { error } : {}),
+              };
+              this.emit("message_status", payload);
+            }
             if (update.pollUpdates) {
               const pollCreation = await this.getMessage(key);
               if (pollCreation) {
@@ -823,6 +902,33 @@ class BaileysProvider extends ProviderClass<WASocket> {
         },
       },
     ];
+
+  /**
+   * Ejecuta una operacion de envio usando un id fijado por el caller.
+   * El Promise de sendMessage sigue significando solamente que Baileys escribio
+   * el stanza: la aceptacion real llega despues por messages.update.
+   */
+  runWithMessageId = async <T>(messageId: string, send: () => Promise<T>): Promise<T> => {
+    const normalized = messageId?.trim();
+    if (!normalized) throw new Error("messageId is required");
+    return this.outboundMessageId.run(normalized, send);
+  };
+
+  /** Unico punto por el que pasan los helpers publicos de envio. */
+  private sendVendorMessage = async <T = WAMessage>(
+    remoteJid: string,
+    content: AnyMessageContent,
+    options?: Record<string, unknown>,
+  ): Promise<T> => {
+    const messageId = this.outboundMessageId.getStore();
+    if (!messageId && options === undefined) {
+      return this.vendor.sendMessage(remoteJid, content) as Promise<T>;
+    }
+    return this.vendor.sendMessage(remoteJid, content, {
+      ...(options || {}),
+      ...(messageId ? { messageId } : {}),
+    }) as Promise<T>;
+  };
 
   /**
    * @param {string} orderId
@@ -912,7 +1018,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       image: { url: filePath },
       caption: text,
     };
-    return this.vendor.sendMessage(number, payload);
+    return this.sendVendorMessage(number, payload);
   };
 
   /**
@@ -932,7 +1038,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       caption: text,
       gifPlayback: this.globalVendorArgs.gifPlayback,
     };
-    return this.vendor.sendMessage(number, payload);
+    return this.sendVendorMessage(number, payload);
   };
 
   /**
@@ -949,7 +1055,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       audio: { url: audioUrl },
       ptt: true,
     };
-    return this.vendor.sendMessage(number, payload);
+    return this.sendVendorMessage(number, payload);
   };
 
   /**
@@ -960,7 +1066,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
    */
   sendText = async (number: string, message: string) => {
     const payload: AnyMessageContent = { text: message };
-    return this.vendor.sendMessage(number, payload);
+    return this.sendVendorMessage(number, payload);
   };
 
   /**
@@ -981,7 +1087,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       caption: text,
     };
 
-    return this.vendor.sendMessage(number, payload);
+    return this.sendVendorMessage(number, payload);
   };
 
   /**
@@ -1016,7 +1122,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       headerType: 1,
     };
 
-    return this.vendor.sendMessage(numberClean, buttonMessage);
+    return this.sendVendorMessage(numberClean, buttonMessage as AnyMessageContent);
   };
 
 
@@ -1054,8 +1160,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     latitude: any,
     longitude: any,
     messages: any = null
-  ) => {
-    await this.vendor.sendMessage(
+  ): Promise<any> => {
+    const response = await this.sendVendorMessage(
       remoteJid,
       {
         location: {
@@ -1065,8 +1171,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       },
       { quoted: messages }
     );
-
-    return { status: "success" };
+    return this.outboundMessageId.getStore() ? response : { status: "success" };
   };
 
   /**
@@ -1084,7 +1189,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     displayName: string,
     orgName: string,
     messages: any = null
-  ) => {
+  ): Promise<any> => {
     const cleanContactNumber = contactNumber.replaceAll(" ", "");
     const waid = cleanContactNumber.replace("+", "");
 
@@ -1096,7 +1201,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       `TEL;type=CELL;type=VOICE;waid=${waid}:${cleanContactNumber}\n` +
       "END:VCARD";
 
-    await this.vendor.sendMessage(
+    const response = await this.sendVendorMessage(
       remoteJid,
       {
         contacts: {
@@ -1106,8 +1211,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       },
       { quoted: messages }
     );
-
-    return { status: "success" };
+    return this.outboundMessageId.getStore() ? response : { status: "success" };
   };
 
   /**
@@ -1141,7 +1245,11 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
     const buffer = await sticker.toMessage();
 
-    await this.vendor.sendMessage(remoteJid, buffer, { quoted: messages });
+    return this.sendVendorMessage(
+      remoteJid,
+      buffer as AnyMessageContent,
+      { quoted: messages },
+    );
   };
 
   private getMimeType = (ctx: WAMessage): string | undefined => {
