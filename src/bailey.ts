@@ -143,6 +143,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private reconnectWindowStartedAt: number | null = null;
 
   /**
+   * Si al abrir el socket ya habia sesion vinculada en disco. Distingue una
+   * reconexion (acotada: si no vuelve, algo esta mal) de un onboarding por QR
+   * (ilimitado: el socket cicla a proposito mientras el QR rota y nadie escanea).
+   */
+  private sessionWasRegistered = false;
+
+  /**
    * Contexto por envio. Baileys permite fijar el messageId antes de enviar,
    * pero Builderbot no expone esa opcion en sus helpers de alto nivel.
    * AsyncLocalStorage evita compartir el id entre envios concurrentes.
@@ -377,6 +384,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
     const { state, saveCreds } = await useMultiFileAuthState(NAME_DIR_SESSION);
     const hasLinkedIdentity =
       Boolean(state.creds.registered) || Boolean(state.creds.me?.id);
+    // Lo guardamos porque `delayedReconnect` necesita distinguir onboarding por
+    // QR de una reconexion con sesion ya vinculada: ver `giveUpAndExit`.
+    this.sessionWasRegistered = hasLinkedIdentity;
     this.offlineReplayWindow.open(
       hasLinkedIdentity && this.globalVendorArgs.offlineReplayEnabled === true
     );
@@ -497,6 +507,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
               await emptyDirSessions(PATH_BASE);
               this.reconnectAttempts = 0;
               this.reconnectWindowStartedAt = null;
+              // Se borro la sesion: lo que viene es un onboarding por QR, no una
+              // reconexion. Sin esto el primer reintento se contaria como acotado.
+              this.sessionWasRegistered = false;
               await this.delayedReconnect();
               return;
             }
@@ -1383,14 +1396,26 @@ class BaileysProvider extends ProviderClass<WASocket> {
     }
     const elapsedMs = now - this.reconnectWindowStartedAt;
 
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+    // Sin sesion vinculada estamos en onboarding por QR: el socket cicla a
+    // proposito mientras el QR rota y nadie escanea. Acotar los reintentos ahi
+    // mataria el onboarding y dejaria el bot en loop de reinicios, asi que la
+    // escalera con techo aplica SOLO cuando ya hay sesion.
+    //
+    // Esto reemplaza `patches/builderbot-provider-sherpa+0.1.6-beta.0.patch` del
+    // consumidor, que subia `maxReconnectAttempts` a 100000 con el comentario
+    // "QR no expira (onboarding)". Ese patch llevaba tiempo sin aplicar (se hizo
+    // para 0.1.6-beta.0 y hoy se instala 0.1.7-beta.0), asi que la intencion
+    // estaba escrita pero no surtia efecto. Aca queda en el codigo.
+    const bounded = this.sessionWasRegistered;
+
+    if (bounded && this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.giveUpAndExit(
         `Max reconnection attempts reached (${this.maxReconnectAttempts}) after ${Math.round(elapsedMs / 1000)}s`
       );
       return;
     }
 
-    if (elapsedMs >= BaileysProvider.MAX_RECONNECT_WINDOW_MS) {
+    if (bounded && elapsedMs >= BaileysProvider.MAX_RECONNECT_WINDOW_MS) {
       this.giveUpAndExit(
         `Reconnect window exhausted (${Math.round(elapsedMs / 1000)}s) after ${this.reconnectAttempts} attempts`
       );
@@ -1402,15 +1427,18 @@ class BaileysProvider extends ProviderClass<WASocket> {
       this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
       BaileysProvider.MAX_RECONNECT_DELAY_MS
     );
-    // Que el ultimo salto no se pase del techo de 15 min.
-    const delay = Math.max(
-      0,
-      Math.min(backoff, BaileysProvider.MAX_RECONNECT_WINDOW_MS - elapsedMs)
-    );
+    // Que el ultimo salto no se pase del techo de 15 min (solo si esta acotado).
+    const delay = bounded
+      ? Math.max(
+        0,
+        Math.min(backoff, BaileysProvider.MAX_RECONNECT_WINDOW_MS - elapsedMs)
+      )
+      : backoff;
 
+    const budget = bounded ? `${this.maxReconnectAttempts}` : "sin limite (QR)";
     this.logger.log(
       `[${new Date().toISOString()}] Reconnection attempt ${this.reconnectAttempts
-      }/${this.maxReconnectAttempts} in ${delay}ms (elapsed ${Math.round(elapsedMs / 1000)}s)`
+      }/${budget} in ${delay}ms (elapsed ${Math.round(elapsedMs / 1000)}s)`
     );
 
     setTimeout(async () => {
