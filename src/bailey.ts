@@ -8,6 +8,7 @@ import type { Boom } from "@hapi/boom";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { WABrowserDescription } from "baileys";
 import { Console } from "console";
+import { Writable } from "node:stream";
 import type { PathOrFileDescriptor } from "fs";
 import { createReadStream, createWriteStream, readFileSync } from "fs";
 import { writeFile } from "fs/promises";
@@ -127,8 +128,19 @@ class BaileysProvider extends ProviderClass<WASocket> {
   };
 
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
+  private maxReconnectAttempts = 20;
   private reconnectDelay = 1000; // 1 segundo inicial
+
+  /**
+   * Techo duro de la escalera de reintentos. Con 20 intentos y el cap de 30s
+   * la escalera tarda ~8 min (1+2+4+8+16 + 30*15 = 481s), asi que este techo
+   * solo actua si alguien toca los numeros de arriba.
+   */
+  private static readonly MAX_RECONNECT_WINDOW_MS = 15 * 60 * 1000;
+  private static readonly MAX_RECONNECT_DELAY_MS = 30_000;
+
+  /** Momento del primer reintento de la racha actual; null si no hay racha. */
+  private reconnectWindowStartedAt: number | null = null;
 
   /**
    * Contexto por envio. Baileys permite fijar el messageId antes de enviar,
@@ -160,9 +172,27 @@ class BaileysProvider extends ProviderClass<WASocket> {
       emitClose: true,
     });
 
+    // El log del provider iba SOLO a baileys.log, un archivo dentro del
+    // contenedor. En un deploy efimero (ECS/Railway) eso es invisible: se
+    // pierde en cada reinicio, justo cuando mas hace falta. El 2026-09-03 un
+    // bot estuvo 3h50m sin socket y no quedo ni un rastro en CloudWatch.
+    // Duplicamos a stdout para que las caidas y reconexiones queden en el log
+    // del deploy.
+    const teeStream = new Writable({
+      write: (chunk, _encoding, callback) => {
+        try {
+          this.logStream.write(chunk);
+          process.stdout.write(chunk);
+        } catch {
+          // Nunca romper el flujo del bot por un fallo de logging.
+        }
+        callback();
+      },
+    });
+
     this.logger = new Console({
-      stdout: this.logStream,
-      stderr: this.logStream,
+      stdout: teeStream,
+      stderr: teeStream,
     });
 
     this.msgRetryCounterCache = new NodeCache({
@@ -350,7 +380,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
     this.offlineReplayWindow.open(
       hasLinkedIdentity && this.globalVendorArgs.offlineReplayEnabled === true
     );
-    const loggerBaileys = pino({ level: "fatal" });
+    // `fatal` silenciaba toda la capa WebSocket de Baileys: cuando el socket se
+    // caia no habia ni una linea que explicara por que. `warn` deja pasar los
+    // errores de conexion sin inundar el log con el trafico normal.
+    const loggerBaileys = pino({ level: "warn" });
 
     this.saveCredsGlobal = saveCreds;
 
@@ -463,6 +496,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
               );
               await emptyDirSessions(PATH_BASE);
               this.reconnectAttempts = 0;
+              this.reconnectWindowStartedAt = null;
               await this.delayedReconnect();
               return;
             }
@@ -473,16 +507,15 @@ class BaileysProvider extends ProviderClass<WASocket> {
               return;
             }
 
-            // Casos críticos - emitir error
+            // Codigo no listado como recuperable. Antes esto emitia
+            // `auth_failure` y no hacia nada mas: el proceso seguia vivo y mudo
+            // para siempre. Ahora igual recorremos la escalera de reintentos
+            // (que termina en `giveUpAndExit`): si el corte era transitorio se
+            // recupera, y si no, el proceso muere y el supervisor lo reinicia.
             this.logger.log(
-              `[${new Date().toISOString()}] Critical error, stopping reconnection attempts`
+              `[${new Date().toISOString()}] Unrecognized disconnect status ${statusCode} (${reason}); retrying before giving up`
             );
-            this.emit("auth_failure", [
-              `Critical connection error: ${reason}`,
-              `Status code: ${statusCode}`,
-              `Check baileys.log for details`,
-              `Need help: https://link.codigoencasa.com/DISCORD`,
-            ]);
+            await this.delayedReconnect();
           }
 
           /** Connection opened successfully */
@@ -492,6 +525,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
             );
             this.reconnectAttempts = 0; // Reset counter on successful connection
             this.reconnectDelay = 1000; // Reset delay
+            this.reconnectWindowStartedAt = null; // Arranca una racha nueva
 
             const parseNumber = `${sock?.user?.id}`.split(":").shift();
             const host = { ...sock?.user, phone: parseNumber };
@@ -1296,6 +1330,30 @@ class BaileysProvider extends ProviderClass<WASocket> {
     return resolve(pathFile);
   };
 
+  /**
+   * Antes, agotar los reintentos solo emitia `auth_failure` y volvia: el proceso
+   * quedaba vivo con el socket muerto. Invisible para ECS (los bots no tienen
+   * healthCheck) y para el webhook de status, que seguia reportando "Activo".
+   * El 2026-09-03 un bot estuvo asi 3h50m y solo volvio porque un deploy no
+   * relacionado lo reinicio; se perdieron 36 mensajes entrantes.
+   *
+   * Ahora terminamos el proceso a proposito: PM2 corre dentro del contenedor en
+   * modo fork y lo levanta de nuevo en segundos, reconectando con la sesion
+   * intacta en disco. Si PM2 no estuviera, ECS reemplaza la task.
+   */
+  private giveUpAndExit(reason: string): void {
+    this.logger.log(
+      `[${new Date().toISOString()}] ${reason}. Terminando el proceso para forzar un arranque limpio.`
+    );
+    this.emit("auth_failure", [
+      reason,
+      `Reintentos agotados; el proceso termina para que el supervisor lo reinicie`,
+      `Check baileys.log for details`,
+    ]);
+    // Margen para que la linea llegue a stdout antes de morir.
+    setTimeout(() => process.exit(1), 1000);
+  }
+
   private shouldReconnect(statusCode: number): boolean {
     // Lista de códigos donde SÍ debemos reconectar
     const reconnectableCodes = [
@@ -1312,36 +1370,47 @@ class BaileysProvider extends ProviderClass<WASocket> {
       504, // Gateway timeout
     ];
 
-    return (
-      reconnectableCodes.includes(statusCode) &&
-      this.reconnectAttempts < this.maxReconnectAttempts
-    );
+    // El limite de intentos ya no vive aca: lo aplica `delayedReconnect`, que
+    // es el unico que sabe cuantos van y cuanto lleva la racha. Mezclarlo aca
+    // hacia que agotar los intentos cayera en el camino de "error critico".
+    return reconnectableCodes.includes(statusCode);
   }
 
   private async delayedReconnect(): Promise<void> {
+    const now = Date.now();
+    if (this.reconnectWindowStartedAt === null) {
+      this.reconnectWindowStartedAt = now;
+    }
+    const elapsedMs = now - this.reconnectWindowStartedAt;
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.log(
-        `[${new Date().toISOString()}] Max reconnection attempts reached (${this.maxReconnectAttempts
-        })`
+      this.giveUpAndExit(
+        `Max reconnection attempts reached (${this.maxReconnectAttempts}) after ${Math.round(elapsedMs / 1000)}s`
       );
-      this.emit("auth_failure", [
-        `Maximum reconnection attempts reached`,
-        `Please check your internet connection`,
-        `Check baileys.log for details`,
-        `Need help: https://link.codigoencasa.com/DISCORD`,
-      ]);
+      return;
+    }
+
+    if (elapsedMs >= BaileysProvider.MAX_RECONNECT_WINDOW_MS) {
+      this.giveUpAndExit(
+        `Reconnect window exhausted (${Math.round(elapsedMs / 1000)}s) after ${this.reconnectAttempts} attempts`
+      );
       return;
     }
 
     this.reconnectAttempts++;
-    const delay = Math.min(
+    const backoff = Math.min(
       this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
-      30000
-    ); // Max 30 segundos
+      BaileysProvider.MAX_RECONNECT_DELAY_MS
+    );
+    // Que el ultimo salto no se pase del techo de 15 min.
+    const delay = Math.max(
+      0,
+      Math.min(backoff, BaileysProvider.MAX_RECONNECT_WINDOW_MS - elapsedMs)
+    );
 
     this.logger.log(
       `[${new Date().toISOString()}] Reconnection attempt ${this.reconnectAttempts
-      }/${this.maxReconnectAttempts} in ${delay}ms`
+      }/${this.maxReconnectAttempts} in ${delay}ms (elapsed ${Math.round(elapsedMs / 1000)}s)`
     );
 
     setTimeout(async () => {
