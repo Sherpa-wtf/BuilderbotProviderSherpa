@@ -69,6 +69,14 @@ export interface BaileysMessageStatusEvent {
   error?: Record<string, unknown>;
 }
 
+/**
+ * `code` del error que tira el provider cuando se niega a enviar porque el
+ * destino no puede recibir. Es contrato con el consumidor durable: significa
+ * "esto NO salio a la red", que es lo unico que autoriza a marcarlo terminal en
+ * vez de dejarlo como resultado desconocido.
+ */
+export const BAILEYS_DESTINATION_UNREACHABLE = "BAILEYS_DESTINATION_UNREACHABLE";
+
 const BAILEYS_STATUS_STAGE: Record<number, BaileysMessageStatusStage> = {
   0: "error",
   1: "pending",
@@ -973,12 +981,34 @@ class BaileysProvider extends ProviderClass<WASocket> {
    *
    *  1. `baileyIsPossibleNumber` — determinista y gratis. Si el numero no puede
    *     existir, se corta con error. Sin falsos negativos.
-   *  2. `onWhatsApp` — autoritativo: se lo pregunta a WhatsApp. Un `exists:false`
-   *     es una respuesta, no un error, asi que tambien corta. Si la consulta
+   *  2. `onWhatsApp` — autoritativo: se lo pregunta a WhatsApp. Si la consulta
    *     falla (red, rate limit), se deja pasar el envio: una consulta rota no
    *     puede bloquear mensajes buenos.
    *
    * El resultado se cachea para no pagar una consulta USync por mensaje.
+   *
+   * OJO CON LA FORMA DE LA RESPUESTA. `onWhatsApp` NO devuelve `exists:false`
+   * para un numero que no existe: lo FILTRA. En baileys 7.0.0-rc14
+   * (Socket/socket.js) la ultima linea es
+   *
+   *     results.list.filter(a => !!a.contact).map(({contact, id}) => ({jid: id, exists: contact}))
+   *
+   * y `contact` viene de `node.attrs.type === 'in'`, o sea un booleano. El
+   * `.filter(!!a.contact)` se come justamente las entradas de los numeros que no
+   * existen, asi que `exists` en el array devuelto vale SIEMPRE `true`. Buscar
+   * `exists === false` es esperar algo que no llega nunca.
+   *
+   * La ausencia es la respuesta: si el numero no vuelve en el resultado, no
+   * tiene WhatsApp. Y hay que distinguir dos vacios que significan lo opuesto:
+   *
+   *     []        -> WhatsApp contesto y el numero no esta   => no existe
+   *     undefined -> la consulta no contesto                 => no sabemos
+   *
+   * Medido contra produccion el 2026-09-04 con 41 numeros de resultado conocido
+   * (24 destinos que habian perdido mensajes, 15 buenos, 2 inventados): 41/41
+   * concluyentes, 0 falsos negativos. El heuristico de largo por si solo
+   * atrapaba 4 de esos 24; los otros 20 tienen largo valido y solo los ve esta
+   * consulta.
    */
   private numeroExisteCache = new NodeCache({
     // Positivos largos: un numero que existe no deja de existir.
@@ -1004,12 +1034,22 @@ class BaileysProvider extends ProviderClass<WASocket> {
     if (cacheado === true) return true;
 
     try {
-      const [info] = (await this.vendor.onWhatsApp(digits)) ?? [];
-      if (info && info.exists === false) {
-        this.numeroExisteCache.set(digits, false, 600);
-        return "WhatsApp dice que el numero no existe";
+      const resultado = await this.vendor.onWhatsApp(digits);
+      // `undefined` es "no contesto", y no autoriza ninguna conclusion.
+      if (Array.isArray(resultado)) {
+        const encontrado = resultado.some((entrada: { jid?: string }) => {
+          const jid = String(entrada?.jid ?? "")
+            .split("@")[0]
+            .split(":")[0]
+            .replace(/\D/g, "");
+          return Boolean(jid) && (jid === digits || jid.startsWith(digits));
+        });
+        if (!encontrado) {
+          this.numeroExisteCache.set(digits, false, 600);
+          return "WhatsApp dice que el numero no existe";
+        }
+        this.numeroExisteCache.set(digits, true);
       }
-      if (info?.exists) this.numeroExisteCache.set(digits, true);
     } catch (e) {
       // Fail-open a proposito: no bloquear por una consulta rota.
       this.logger.log(
@@ -1030,7 +1070,17 @@ class BaileysProvider extends ProviderClass<WASocket> {
         `[${new Date().toISOString()}] [ENVIO_RECHAZADO] ${remoteJid}: ${motivo}`,
       );
       this.emit("send_rejected", { remoteJid, reason: motivo });
-      throw new Error(`No se puede enviar a ${remoteJid}: ${motivo}`);
+      // El `code` es contrato con el consumidor durable. Sin el, arriba solo hay
+      // un Error generico: se clasifica como resultado desconocido y el saliente
+      // termina en cuarentena silenciosa, que es el mismo final que teniamos
+      // antes del guard. Con el, se sabe que NO se envio y se puede decir por que.
+      const error = new Error(
+        `No se puede enviar a ${remoteJid}: ${motivo}`,
+      ) as Error & { code: string; remoteJid: string; reason: string };
+      error.code = BAILEYS_DESTINATION_UNREACHABLE;
+      error.remoteJid = remoteJid;
+      error.reason = motivo;
+      throw error;
     }
 
     const messageId = this.outboundMessageId.getStore();
