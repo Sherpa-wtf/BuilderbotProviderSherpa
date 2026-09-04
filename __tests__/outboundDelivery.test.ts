@@ -60,15 +60,15 @@ describe('BaileysProvider durable outbound primitives', () => {
 
     test('rejects blank message ids, trims valid ids and never lets helper options override them', async () => {
         await expect(
-            provider.runWithMessageId('   ', () => provider.sendText('blank@s.whatsapp.net', 'nope')),
+            provider.runWithMessageId('   ', () => provider.sendText('5491100000001@s.whatsapp.net', 'nope')),
         ).rejects.toThrow('messageId is required')
         await expect(
-            (provider as any).runWithMessageId(undefined, () => provider.sendText('missing@s.whatsapp.net', 'nope')),
+            (provider as any).runWithMessageId(undefined, () => provider.sendText('5491100000002@s.whatsapp.net', 'nope')),
         ).rejects.toThrow('messageId is required')
 
         await provider.runWithMessageId('  3EB0TRIMMEDTRIMMEDTRIM  ', () =>
             (provider as any).sendVendorMessage(
-                'trimmed@s.whatsapp.net',
+                '5491100000003@s.whatsapp.net',
                 { text: 'hola' },
                 { quoted: { key: { id: 'quoted' } }, messageId: 'must-not-win' },
             ),
@@ -84,9 +84,9 @@ describe('BaileysProvider durable outbound primitives', () => {
     test('preserves legacy helper results and options outside a deterministic id context', async () => {
         const quoted = { key: { id: 'quoted-without-context' } }
 
-        const location = await provider.sendLocation('plain-location@s.whatsapp.net', -34.6, -58.4, quoted)
+        const location = await provider.sendLocation('5491100000004@s.whatsapp.net', -34.6, -58.4, quoted)
         const contact = await provider.sendContact(
-            'plain-contact@s.whatsapp.net',
+            '5491100000005@s.whatsapp.net',
             '+54 9 11 1111 1111' as any,
             'Ada',
             'Sherpa',
@@ -106,15 +106,15 @@ describe('BaileysProvider durable outbound primitives', () => {
 
         const first = provider.runWithMessageId('3EB0FIRSTFIRSTFIRSTFIRST', async () => {
             await wait()
-            await provider.sendText('first@s.whatsapp.net', 'first')
+            await provider.sendText('5491100000006@s.whatsapp.net', 'first')
             await provider.runWithMessageId('3EB0INNERINNERINNERINNER', () =>
-                provider.sendText('inner@s.whatsapp.net', 'inner'),
+                provider.sendText('5491100000007@s.whatsapp.net', 'inner'),
             )
-            await provider.sendText('outer@s.whatsapp.net', 'outer')
+            await provider.sendText('5491100000008@s.whatsapp.net', 'outer')
         })
         const second = provider.runWithMessageId('3EB0SECONDSECONDSECONDSE', async () => {
             await wait()
-            await provider.sendText('second@s.whatsapp.net', 'second')
+            await provider.sendText('5491100000009@s.whatsapp.net', 'second')
         })
 
         release.splice(0).forEach((resolve) => resolve())
@@ -124,27 +124,27 @@ describe('BaileysProvider durable outbound primitives', () => {
             sendMessage.mock.calls.map(([jid, _content, options]) => [jid, (options as any)?.messageId]),
         )
         expect(idsByJid).toEqual({
-            'first@s.whatsapp.net': '3EB0FIRSTFIRSTFIRSTFIRST',
-            'inner@s.whatsapp.net': '3EB0INNERINNERINNERINNER',
-            'outer@s.whatsapp.net': '3EB0FIRSTFIRSTFIRSTFIRST',
-            'second@s.whatsapp.net': '3EB0SECONDSECONDSECONDSE',
+            '5491100000006@s.whatsapp.net': '3EB0FIRSTFIRSTFIRSTFIRST',
+            '5491100000007@s.whatsapp.net': '3EB0INNERINNERINNERINNER',
+            '5491100000008@s.whatsapp.net': '3EB0FIRSTFIRSTFIRSTFIRST',
+            '5491100000009@s.whatsapp.net': '3EB0SECONDSECONDSECONDSE',
         })
     })
 
     test('returns the real provider response for location, contact and sticker', async () => {
         const location = await provider.runWithMessageId('3EB0LOCATIONLOCATIONLO', () =>
-            provider.sendLocation('location@s.whatsapp.net', -34.6, -58.4, { key: { id: 'quoted' } }),
+            provider.sendLocation('5491100000010@s.whatsapp.net', -34.6, -58.4, { key: { id: 'quoted' } }),
         )
         const contact = await provider.runWithMessageId('3EB0CONTACTCONTACTCONT', () =>
             provider.sendContact(
-                'contact@s.whatsapp.net',
+                '5491100000011@s.whatsapp.net',
                 '+54 9 11 1111 1111' as any,
                 'Ada',
                 'Sherpa',
             ),
         )
         const sticker = await provider.runWithMessageId('3EB0STICKERSTICKERSTI', () =>
-            provider.sendSticker('sticker@s.whatsapp.net', Buffer.from('image'), {}),
+            provider.sendSticker('5491100000012@s.whatsapp.net', Buffer.from('image'), {}),
         )
 
         expect(location.key.id).toBe('3EB0LOCATIONLOCATIONLO')
@@ -192,11 +192,11 @@ describe('BaileysProvider durable outbound primitives', () => {
 
     test('routes every current high-level outbound helper through the deterministic id context', async () => {
         const sends: Array<[string, () => Promise<unknown>]> = [
-            ['3EB0IMAGEIMAGEIMAGEIMAGE', () => provider.sendImage('image@s.whatsapp.net', '/tmp/image.jpg', 'image')],
-            ['3EB0VIDEOVIDEOVIDEOVIDE', () => provider.sendVideo('video@s.whatsapp.net', __filename, 'video')],
-            ['3EB0AUDIOAUDIOAUDIOAUDIO', () => provider.sendAudio('audio@s.whatsapp.net', '/tmp/audio.ogg')],
-            ['3EB0TEXTTEXTTEXTTEXTTEXT', () => provider.sendText('text@s.whatsapp.net', 'text')],
-            ['3EB0FILEFILEFILEFILEFILE', () => provider.sendFile('file@s.whatsapp.net', '/tmp/document.pdf', 'file')],
+            ['3EB0IMAGEIMAGEIMAGEIMAGE', () => provider.sendImage('5491100000017@s.whatsapp.net', '/tmp/image.jpg', 'image')],
+            ['3EB0VIDEOVIDEOVIDEOVIDE', () => provider.sendVideo('5491100000018@s.whatsapp.net', __filename, 'video')],
+            ['3EB0AUDIOAUDIOAUDIOAUDIO', () => provider.sendAudio('5491100000019@s.whatsapp.net', '/tmp/audio.ogg')],
+            ['3EB0TEXTTEXTTEXTTEXTTEXT', () => provider.sendText('5491100000013@s.whatsapp.net', 'text')],
+            ['3EB0FILEFILEFILEFILEFILE', () => provider.sendFile('5491100000014@s.whatsapp.net', '/tmp/document.pdf', 'file')],
             [
                 '3EB0BUTTONBUTTONBUTTONBU',
                 () => provider.sendButtons('5491111111111', 'choose', [{ body: 'A' }] as any),
