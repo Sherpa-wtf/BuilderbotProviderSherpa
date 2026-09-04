@@ -44,6 +44,7 @@ import type { BaileyGlobalVendorArgs } from "./type";
 import {
   baileyGenerateImage,
   baileyCleanNumber,
+  baileyIsPossibleNumber,
   baileyIsValidNumber,
   emptyDirSessions,
 } from "./utils";
@@ -962,11 +963,76 @@ class BaileysProvider extends ProviderClass<WASocket> {
   };
 
   /** Unico punto por el que pasan los helpers publicos de envio. */
+  /**
+   * Mandar a un numero que no existe en WhatsApp NO falla: `getUSyncDevices`
+   * resuelve cero dispositivos, `relayMessage` cifra para nadie, `sendMessage`
+   * resuelve OK con un id generado localmente y no llega ningun acuse jamas.
+   * Todas las capas informan exito y el mensaje no le llega a nadie.
+   *
+   * Se comprueba antes de enviar, en dos niveles:
+   *
+   *  1. `baileyIsPossibleNumber` — determinista y gratis. Si el numero no puede
+   *     existir, se corta con error. Sin falsos negativos.
+   *  2. `onWhatsApp` — autoritativo: se lo pregunta a WhatsApp. Un `exists:false`
+   *     es una respuesta, no un error, asi que tambien corta. Si la consulta
+   *     falla (red, rate limit), se deja pasar el envio: una consulta rota no
+   *     puede bloquear mensajes buenos.
+   *
+   * El resultado se cachea para no pagar una consulta USync por mensaje.
+   */
+  private numeroExisteCache = new NodeCache({
+    // Positivos largos: un numero que existe no deja de existir.
+    // Los negativos se guardan con TTL corto (ver `recordarNoExiste`) para que
+    // alguien que se acaba de crear la cuenta no quede bloqueado media hora.
+    stdTTL: 86400,
+    checkperiod: 3600,
+    useClones: false,
+  });
+
+  private async numeroPuedeRecibir(remoteJid: string): Promise<true | string> {
+    // Grupos y difusiones no pasan por USync.
+    if (isJidGroup(remoteJid) || isJidBroadcast(remoteJid)) return true;
+
+    const digits = baileyCleanNumber(remoteJid, true);
+
+    if (!baileyIsPossibleNumber(digits)) {
+      return `el numero no puede existir (${digits.length} digitos)`;
+    }
+
+    const cacheado = this.numeroExisteCache.get<boolean>(digits);
+    if (cacheado === false) return "WhatsApp dice que el numero no existe";
+    if (cacheado === true) return true;
+
+    try {
+      const [info] = (await this.vendor.onWhatsApp(digits)) ?? [];
+      if (info && info.exists === false) {
+        this.numeroExisteCache.set(digits, false, 600);
+        return "WhatsApp dice que el numero no existe";
+      }
+      if (info?.exists) this.numeroExisteCache.set(digits, true);
+    } catch (e) {
+      // Fail-open a proposito: no bloquear por una consulta rota.
+      this.logger.log(
+        `[${new Date().toISOString()}] onWhatsApp fallo para ${digits}, se envia igual: ${(e as Error)?.message}`,
+      );
+    }
+    return true;
+  }
+
   private sendVendorMessage = async <T = WAMessage>(
     remoteJid: string,
     content: AnyMessageContent,
     options?: Record<string, unknown>,
   ): Promise<T> => {
+    const motivo = await this.numeroPuedeRecibir(remoteJid);
+    if (motivo !== true) {
+      this.logger.log(
+        `[${new Date().toISOString()}] [ENVIO_RECHAZADO] ${remoteJid}: ${motivo}`,
+      );
+      this.emit("send_rejected", { remoteJid, reason: motivo });
+      throw new Error(`No se puede enviar a ${remoteJid}: ${motivo}`);
+    }
+
     const messageId = this.outboundMessageId.getStore();
     if (!messageId && options === undefined) {
       return this.vendor.sendMessage(remoteJid, content) as Promise<T>;

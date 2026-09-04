@@ -1,4 +1,4 @@
-import { baileyCleanNumber, baileyGenerateImage, baileyIsValidNumber, emptyDirSessions } from '../src/utils'
+import { baileyCleanNumber, baileyGenerateImage, baileyIsPossibleNumber, baileyIsValidNumber, emptyDirSessions } from '../src/utils'
 import { expect, describe, test, jest } from '@jest/globals'
 import { utils } from '@builderbot/bot'
 import { createWriteStream } from 'fs'
@@ -138,5 +138,56 @@ describe('#mockEmptyDir', () => {
 
         // Act & Assert
         await expect(emptyDirSessions(pathBase)).rejects.toEqual(error)
+    })
+})
+
+/**
+ * Regresión del 2026-09-04.
+ *
+ * Mandar a un número que no existe en WhatsApp NO falla en ninguna capa:
+ * `getUSyncDevices` resuelve cero dispositivos, `relayMessage` cifra para
+ * nadie, `sendMessage` resuelve OK con un id generado localmente, y no llega
+ * ningún acuse jamás. El CRM se queda con `source_id: null` para siempre
+ * mientras la UI muestra ✓✓.
+ *
+ * Reproducido contra producción mandando a `549111551260459` (el `15` de
+ * discado local metido adentro): HTTP 200 "sended" en 637 ms, CERO eventos de
+ * acuse, contra 38 acuses del mismo bot ese día con números reales.
+ *
+ * De 12 pérdidas confirmadas en 7 días, 11 eran números mal formados con
+ * exactamente estas tres formas.
+ */
+describe('#baileyIsPossibleNumber', () => {
+    test('rechaza las tres formas de número mal cargado que causaron pérdidas reales', () => {
+        // El `15` de discado local metido adentro: 549 · 11 · 15 · 51260459
+        expect(baileyIsPossibleNumber('549111551260459')).toBe(false)
+        // El `0` del código de área: 549 · 011 · 37968697
+        expect(baileyIsPossibleNumber('54901137968697')).toBe(false)
+        // Truncado
+        expect(baileyIsPossibleNumber('5494538173')).toBe(false)
+        // Basura de carga
+        expect(baileyIsPossibleNumber('549')).toBe(false)
+    })
+
+    test('acepta los números argentinos bien formados', () => {
+        // Móvil: 54 · 9 · área · local = 13 dígitos
+        expect(baileyIsPossibleNumber('5491151260459')).toBe(true)
+        expect(baileyIsPossibleNumber('5493435209339')).toBe(true)
+        expect(baileyIsPossibleNumber('5492932411976')).toBe(true)
+        // Fijo: 54 · área · local = 12 dígitos
+        expect(baileyIsPossibleNumber('543436114642')).toBe(true)
+    })
+
+    test('no rompe números de países que no tenemos modelados', () => {
+        expect(baileyIsPossibleNumber('14155552671')).toBe(true)   // USA
+        expect(baileyIsPossibleNumber('34612345678')).toBe(true)   // España
+        expect(baileyIsPossibleNumber('5511987654321')).toBe(true) // Brasil
+    })
+
+    test('tolera el formato con el que llega el número en el resto del provider', () => {
+        expect(baileyIsPossibleNumber('+54 9 11 5126-0459'.replace(/-/g, ''))).toBe(true)
+        expect(baileyIsPossibleNumber('5491151260459@s.whatsapp.net')).toBe(true)
+        expect(baileyIsPossibleNumber('')).toBe(false)
+        expect(baileyIsPossibleNumber('no-es-un-numero')).toBe(false)
     })
 })
