@@ -14,6 +14,9 @@ const phoneNumber = '+123456789'
 
 jest.mock('../src/baileyWrapper', () => ({
     downloadMediaMessage: jest.fn(),
+    // El guard previo al envio los llama en cada saliente.
+    isJidGroup: jest.fn((jid: string) => typeof jid === 'string' && jid.endsWith('@g.us')),
+    isJidBroadcast: jest.fn((jid: string) => typeof jid === 'string' && jid.endsWith('@broadcast')),
     proto: {
         Message: {
             fromObject: jest.fn().mockReturnValue({}),
@@ -31,6 +34,7 @@ jest.mock('../src/baileyWrapper', () => ({
     }),
     makeWASocketOther: jest.fn().mockImplementation(() => ({
         ev: { on: jest.fn() },
+        onWhatsApp: jest.fn(async () => [{ exists: true }]),
         authState: { creds: { registered: false } },
         waitForConnectionUpdate: jest.fn(),
         requestPairingCode: jest.fn(),
@@ -50,6 +54,10 @@ jest.mock('wa-sticker-formatter', () => {
 })
 
 jest.mock('../src/utils', () => ({
+    // El guard previo al envio tambien lo llama. Se mockea en vez de traer el
+    // modulo real porque este archivo mockea utils entero; la validacion de
+    // verdad se ejercita en utils.test.ts, contra la implementacion real.
+    baileyIsPossibleNumber: jest.fn(() => true),
     baileyCleanNumber: jest.fn().mockImplementation(() => phoneNumber),
     baileyIsValidNumber: jest.fn((number: string) => number === '1234567890'),
 }))
@@ -1286,8 +1294,8 @@ describe('#BaileysProvider', () => {
             }
 
             // Mock getAggregateVotesInPollMessage
-            const originalGetAggregateVotes = require('baileys-sherpa').getAggregateVotesInPollMessage
-            require('baileys-sherpa').getAggregateVotesInPollMessage = jest.fn().mockReturnValue({})
+            const originalGetAggregateVotes = require('baileys').getAggregateVotesInPollMessage
+            require('baileys').getAggregateVotesInPollMessage = jest.fn().mockReturnValue({})
 
             try {
                 // Act
@@ -1297,7 +1305,7 @@ describe('#BaileysProvider', () => {
                 expect(provider.emit).toHaveBeenCalled()
             } finally {
                 // Restore original function
-                require('baileys-sherpa').getAggregateVotesInPollMessage = originalGetAggregateVotes
+                require('baileys').getAggregateVotesInPollMessage = originalGetAggregateVotes
             }
         })
     })
