@@ -17,7 +17,7 @@ describe('administrative logout without business runtime', () => {
         await fs.writeFile(path.join(dir, 'creds.json'), '{}')
         authorize = jest.fn(async () => ({ ...identity, purpose: 'logout_only', expiresAt: Date.now() + 15000 }))
         socket = { ev: new EventEmitter(), waitForSocketOpen: jest.fn(async () => {}), generateMessageTag: () => 'ack1', query: jest.fn(async () => ({ tag: 'iq', attrs: { id: 'ack1', type: 'result' } })), end: jest.fn() }
-        ;(makeWASocketOther as jest.Mock).mockReturnValue(socket)
+        ;(makeWASocketOther as jest.Mock).mockImplementation(() => { setImmediate(() => socket.ev.emit('connection.update', { connection: 'open' })); return socket })
         ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: true, me: { id: 'linked@s.whatsapp.net' } }, keys: { get: jest.fn(), set: jest.fn() } }, saveCreds: jest.fn() })
     })
     afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }); jest.clearAllMocks() })
@@ -38,6 +38,28 @@ describe('administrative logout without business runtime', () => {
         await expect(run()).rejects.toThrow('CONTROL_LINKED_SESSION_REQUIRED')
         expect(makeWASocketOther).not.toHaveBeenCalled()
         expect(await fs.readFile(path.join(dir, 'creds.json'), 'utf8')).toBe('{}')
+    })
+    it('waits for authenticated WhatsApp connection, not merely the transport opening', async () => {
+        let created!: () => void
+        const ready = new Promise<void>(resolve => { created = resolve })
+        ;(makeWASocketOther as jest.Mock).mockImplementation(() => { created(); return socket })
+        const result = run()
+        await ready
+        await new Promise(resolve => setTimeout(resolve, 20))
+        const earlyCalls = socket.query.mock.calls.length
+        socket.ev.emit('connection.update', { connection: 'open' })
+        await result
+        expect(socket.waitForSocketOpen).not.toHaveBeenCalled()
+        expect(earlyCalls).toBe(0)
+        expect(socket.query).toHaveBeenCalledTimes(1)
+        expect(socket.ev.listenerCount('connection.update')).toBe(0)
+    })
+    it('does not dispatch logout when authentication closes before becoming ready', async () => {
+        ;(makeWASocketOther as jest.Mock).mockImplementation(() => { setImmediate(() => socket.ev.emit('connection.update', { connection: 'close' })); return socket })
+        expect(await run()).toEqual({ result: 'uncertain' })
+        expect(socket.query).not.toHaveBeenCalled()
+        expect(await fs.readFile(path.join(dir, 'creds.json'), 'utf8')).toBe('{}')
+        expect(socket.ev.listenerCount('connection.update')).toBe(0)
     })
     it('requires a correlated remote result then cleans auth only and replays durable evidence', async () => {
         expect(await run()).toEqual({ result: 'disconnected', evidenceStage: 'remote_ack_and_local_cleanup', remoteAckId: 'ack1' })

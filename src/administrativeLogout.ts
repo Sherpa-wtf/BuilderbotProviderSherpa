@@ -106,10 +106,20 @@ export async function administrativeLogout(options: {
                 shouldIgnoreJid: () => true, shouldSyncHistoryMessage: () => false,
                 getMessage: async () => undefined, defaultQueryTimeoutMs: 10000 })
             socket.ev.on('creds.update', () => { void writes.run(saveCreds).catch(() => undefined) })
-            let timer: ReturnType<typeof setTimeout>
-            try {
-                await Promise.race([socket.waitForSocketOpen(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('CONTROL_SOCKET_TIMEOUT')), 10000) })])
-            } finally { clearTimeout(timer!) }
+            // Transport-open precedes Noise/login. Only connection.update open confirms authentication.
+            await new Promise<void>((resolve, reject) => {
+                const finish = (error?: Error) => {
+                    clearTimeout(timer)
+                    socket!.ev.off('connection.update', onConnection)
+                    error ? reject(error) : resolve()
+                }
+                const onConnection = (update: { connection?: string }) => {
+                    if (update.connection === 'open') finish()
+                    else if (update.connection === 'close') finish(new Error('CONTROL_SOCKET_CLOSED'))
+                }
+                const timer = setTimeout(() => finish(new Error('CONTROL_SOCKET_TIMEOUT')), 10000)
+                socket!.ev.on('connection.update', onConnection)
+            })
             const grant = await validate()
             const remoteAckId = socket.generateMessageTag()
             if (!remoteAckId || remoteAckId.length > 128) throw new Error('CONTROL_ACK_ID_INVALID')
