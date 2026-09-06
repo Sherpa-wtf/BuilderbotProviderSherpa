@@ -28,6 +28,17 @@ describe('administrative logout without business runtime', () => {
         expect(useMultiFileAuthState).not.toHaveBeenCalled()
         expect(makeWASocketOther).not.toHaveBeenCalled()
     })
+    it('disconnects a QR-linked session even when pairing-code registered remains false', async () => {
+        ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: false, me: { id: 'linked@s.whatsapp.net' } }, keys: { get: jest.fn(), set: jest.fn() } }, saveCreds: jest.fn() })
+        expect(await run()).toMatchObject({ result: 'disconnected', evidenceStage: 'remote_ack_and_local_cleanup' })
+        expect(socket.query).toHaveBeenCalledTimes(1)
+    })
+    it('refuses an unlinked session before opening a socket or deleting credentials', async () => {
+        ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: true }, keys: {} }, saveCreds: jest.fn() })
+        await expect(run()).rejects.toThrow('CONTROL_LINKED_SESSION_REQUIRED')
+        expect(makeWASocketOther).not.toHaveBeenCalled()
+        expect(await fs.readFile(path.join(dir, 'creds.json'), 'utf8')).toBe('{}')
+    })
     it('requires a correlated remote result then cleans auth only and replays durable evidence', async () => {
         expect(await run()).toEqual({ result: 'disconnected', evidenceStage: 'remote_ack_and_local_cleanup', remoteAckId: 'ack1' })
         await expect(fs.stat(path.join(dir, 'creds.json'))).rejects.toMatchObject({ code: 'ENOENT' })

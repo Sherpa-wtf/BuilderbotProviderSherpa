@@ -97,7 +97,8 @@ export async function administrativeLogout(options: {
         if (journal && (!journal.remoteAckId || journal.remoteAckId.length > 128)) throw new Error('CONTROL_JOURNAL_INVALID')
         if (!journal) {
             const { state, saveCreds } = await useMultiFileAuthState(directory)
-            if (!state.creds.registered || !state.creds.me?.id) throw new Error('CONTROL_LINKED_SESSION_REQUIRED')
+            // QR pairing sets me.id; registered belongs to the pairing-code flow.
+            if (!state.creds.me?.id) throw new Error('CONTROL_LINKED_SESSION_REQUIRED')
             await validate()
             const originalSet = state.keys.set.bind(state.keys)
             state.keys.set = data => writes.run(() => originalSet(data))
