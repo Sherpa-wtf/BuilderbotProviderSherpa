@@ -164,10 +164,15 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private socketGeneration = 0;
   private qrChallenges = new QrChallengeStore(async (qr) => qrImage.imageSync(qr, { type: "png", margin: 4 }) as Buffer);
   private lifecycleSnapshot: ProviderLifecycleEvent | null = null;
+  // Known missing authentication survives replacement sockets until a real open.
+  private lifecycleRequiresLink = false;
 
   public getLifecycleSnapshot = (): ProviderLifecycleEvent | null => this.lifecycleSnapshot;
 
   private reportLifecycle(state: ProviderLifecycleEvent["state"], reasonCode?: number, phoneNumber?: string): void {
+    if (state === "ready") this.lifecycleRequiresLink = false;
+    if (state === "requires_link") this.lifecycleRequiresLink = true;
+    if (this.lifecycleRequiresLink && (state === "connecting" || state === "disconnected")) state = "requires_link";
     this.lifecycleSnapshot = { state, socketGeneration: this.socketGeneration, observedAt: new Date().toISOString(), ...(reasonCode === undefined ? {} : { reasonCode }), ...(phoneNumber ? { phoneNumber } : {}) };
     this.emit("provider.lifecycle", this.lifecycleSnapshot);
   }
@@ -596,7 +601,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
           /** Connection closed for various reasons */
           if (connection === "close") {
             this.qrChallenges.invalidate(socketGeneration);
-            this.reportLifecycle("disconnected", statusCode);
+            this.reportLifecycle(statusCode === DisconnectReason.loggedOut ? "requires_link" : "disconnected", statusCode);
             this.logger.log(
               `[${new Date().toISOString()}] Connection closed. Status: ${statusCode}, Reason: ${reason}`
             );

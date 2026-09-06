@@ -17,6 +17,7 @@ jest.mock('../src/baileyWrapper', () => ({
   DisconnectReason: { loggedOut: 401, connectionClosed: 428, connectionLost: 408, connectionReplaced: 440, timedOut: 408, badSession: 500, restartRequired: 515 },
   proto: { Message: { create: jest.fn() } },
 }))
+jest.mock('../src/utils', () => ({ ...jest.requireActual('../src/utils'), emptyDirSessions: jest.fn(async () => true) }))
 jest.mock('../src/releaseTmp', () => ({ releaseTmp: jest.fn(async () => undefined) }))
 jest.mock('wa-sticker-formatter', () => ({ Sticker: jest.fn() }))
 jest.mock('fs', () => ({
@@ -39,6 +40,48 @@ describe('provider lifecycle and current QR only', () => {
     jest.spyOn(provider as any, 'delayedReconnect').mockResolvedValue(undefined)
   })
   afterEach(() => { jest.restoreAllMocks() })
+
+  test('known logout requires linking immediately and cannot downgrade during replacement startup', async () => {
+    const observed: any[] = []
+    provider.on('provider.lifecycle', event => observed.push(event))
+    await (provider as any).initVendor()
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } })
+    // Must be known before async session cleanup / replacement QR.
+    expect(observed[0]).toMatchObject({ state: 'requires_link', reasonCode: 401 })
+    await flush()
+    await (provider as any).initVendor()
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'connecting' })
+    expect(observed[observed.length - 1]).toMatchObject({ state: 'requires_link', socketGeneration: 2 })
+    ;(provider.vendor as any).ev.emit('connection.update', { qr: 'local-fixture-not-real-qr' })
+    await flush()
+    expect(observed.every(event => event.state === 'requires_link')).toBe(true)
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } })
+    expect(observed.slice(-2).map(event => event.state)).toEqual(['ready', 'disconnected'])
+  })
+
+  test('QR proves linking required even if a later reconnect event arrives before ready', async () => {
+    await (provider as any).initVendor()
+    ;(provider.vendor as any).ev.emit('connection.update', { qr: 'local-qr-fixture' })
+    await flush()
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'connecting' })
+    expect(provider.getLifecycleSnapshot()?.state).toBe('requires_link')
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } })
+    expect(provider.getLifecycleSnapshot()?.state).toBe('requires_link')
+  })
+
+  test('unknown disconnect does not invent logout and obsolete socket logout cannot downgrade ready', async () => {
+    await (provider as any).initVendor()
+    const old: any = provider.vendor
+    old.ev.emit('connection.update', { connection: 'close' })
+    expect(provider.getLifecycleSnapshot()?.state).toBe('disconnected')
+    old.ev.emit('connection.update', { connection: 'connecting' })
+    expect(provider.getLifecycleSnapshot()?.state).toBe('connecting')
+    await (provider as any).initVendor()
+    ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
+    old.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } })
+    expect(provider.getLifecycleSnapshot()?.state).toBe('ready')
+  })
 
   test('missing QR is a safe pending response, never reads a stale file', () => {
     const res = response()
