@@ -657,7 +657,8 @@ describe('#BaileysProvider', () => {
             const mockSendMessage = mockSendSuccess
             provider.vendor.sendMessage = mockSendMessage
 
-            jest.spyOn(fs, 'readFileSync').mockReturnValue(Buffer.from('sticker-buffer'))
+            const readFile = jest.spyOn(fs, 'readFileSync').mockReturnValue(Buffer.from('sticker-buffer'))
+            try {
             // Act
             const result = await provider.sendVideo(number, filePath, text)
 
@@ -668,6 +669,7 @@ describe('#BaileysProvider', () => {
                 caption: text,
                 gifPlayback: provider.globalVendorArgs.gifPlayback,
             })
+            } finally { readFile.mockRestore() }
         })
     })
 
@@ -1311,22 +1313,17 @@ describe('#BaileysProvider', () => {
     })
 
     describe('#indexHome', () => {
-        test('should send the correct image file', () => {
-            // Arrange
-            const mockedReadStream = jest.fn()
-            const mockedFileStream = { pipe: jest.fn() }
-            mockedReadStream.mockReturnValueOnce(mockedFileStream)
-            require('fs').createReadStream = mockedReadStream
-            const req = { params: { idBotName: 'bot123' } }
+        test('sends the current published artifact, not a persisted filename', () => {
+            const image = Buffer.from('current-png')
+            const artifact = { image, socketGeneration: 2, revision: 3, expiresAt: 40000 }
+            jest.spyOn(provider['qrChallenges'], 'current').mockReturnValueOnce(artifact as any)
             const res = { writeHead: jest.fn(), end: jest.fn() }
-            const expectedImagePath = 'ruta/esperada/bot123.qr.png'
-            const mockedJoin = jest.spyOn(path, 'join')
-            mockedJoin.mockReturnValueOnce(expectedImagePath)
-
-            // Act
-            provider['indexHome'](req as any, res as any, mockNext)
-            // Assert
-            expect(res.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'image/png' })
+            provider['indexHome']({} as any, res as any, mockNext)
+            expect(res.writeHead).toHaveBeenCalledWith(200, {
+                'Content-Type': 'image/png', 'Cache-Control': 'private, no-store',
+                'X-QR-Instance-Id': expect.any(String), 'X-QR-Generation': '2', 'X-QR-Revision': '3', 'X-QR-Expires-At': new Date(40000).toISOString(),
+            })
+            expect(res.end).toHaveBeenCalledWith(image)
         })
     })
 

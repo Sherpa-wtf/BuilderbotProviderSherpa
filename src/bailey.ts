@@ -6,11 +6,12 @@ import type {
 } from "@builderbot/bot/dist/types";
 import type { Boom } from "@hapi/boom";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { WABrowserDescription } from "baileys";
 import { Console } from "console";
 import { Writable } from "node:stream";
 import type { PathOrFileDescriptor } from "fs";
-import { createReadStream, createWriteStream, readFileSync } from "fs";
+import { createWriteStream, readFileSync } from "fs";
 import { writeFile } from "fs/promises";
 import mime from "mime-types";
 import NodeCache from "node-cache";
@@ -40,9 +41,10 @@ import {
 } from "./baileyWrapper";
 import { releaseTmp } from "./releaseTmp";
 import { OfflineReplayWindow } from "./offlineReplay";
+import { QrChallengeStore } from "./qrChallenge";
+import qrImage from "qr-image";
 import type { BaileyGlobalVendorArgs } from "./type";
 import {
-  baileyGenerateImage,
   baileyCleanNumber,
   baileyIsPossibleNumber,
   baileyIsValidNumber,
@@ -112,7 +114,64 @@ const statusErrorEvidence = (update: any): Record<string, unknown> | undefined =
   return Object.keys(evidence).length > 0 ? evidence : undefined;
 };
 
+export interface ProviderLifecycleEvent {
+  state: "connecting" | "ready" | "requires_link" | "disconnected" | "error";
+  socketGeneration: number;
+  observedAt: string;
+  reasonCode?: number;
+  phoneNumber?: string;
+}
+
 class BaileysProvider extends ProviderClass<WASocket> {
+  private readonly qrInstanceId = randomUUID();
+  private lifecycleStopped = false;
+  private lifecycleSendWrapper: ((descriptor: unknown, network: () => Promise<any>) => Promise<any>) | null = null;
+  public setLifecycleSendWrapper(wrapper: (descriptor: unknown, network: () => Promise<any>) => Promise<any>): void { this.lifecycleSendWrapper = wrapper; }
+  private lifecycleIncomingGate: ((payload: any, dispatch: () => boolean) => Promise<boolean>) | null = null;
+  public setLifecycleIncomingGate(gate: (payload: any, dispatch: () => boolean) => Promise<boolean>): void { this.lifecycleIncomingGate = gate; }
+  private lifecycleGuard: (() => Promise<void>) | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  public setLifecycleGuard(guard: () => Promise<void>): void { this.lifecycleGuard = guard; }
+
+  /** Intentional stop is one-way for this incarnation. A new registration starts a new runtime. */
+  public stopLifecycle(): void {
+    this.lifecycleStopped = true;
+    this.socketGeneration++;
+    this.qrChallenges.invalidate(this.socketGeneration);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.vendor?.end(new Error("Intentional lifecycle stop"));
+  }
+
+  /** Authority/storage outage is transport recovery, never intentional pause or logout. */
+  public recoverLifecycle(): void {
+    if (this.lifecycleStopped) return;
+    this.socketGeneration++;
+    this.qrChallenges.invalidate(this.socketGeneration);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.vendor?.end(new Error("Lifecycle ingress storage unavailable"));
+    this.reportLifecycle("disconnected");
+    void this.delayedReconnect();
+  }
+
+  private assertSocketCurrent(generation: number): void {
+    if (this.lifecycleStopped || generation !== this.socketGeneration) {
+      throw Object.assign(new Error("Lifecycle authorization revoked"), { code: "BOT_LIFECYCLE_DENIED" });
+    }
+  }
+
+  private socketGeneration = 0;
+  private qrChallenges = new QrChallengeStore(async (qr) => qrImage.imageSync(qr, { type: "png", margin: 4 }) as Buffer);
+  private lifecycleSnapshot: ProviderLifecycleEvent | null = null;
+
+  public getLifecycleSnapshot = (): ProviderLifecycleEvent | null => this.lifecycleSnapshot;
+
+  private reportLifecycle(state: ProviderLifecycleEvent["state"], reasonCode?: number, phoneNumber?: string): void {
+    this.lifecycleSnapshot = { state, socketGeneration: this.socketGeneration, observedAt: new Date().toISOString(), ...(reasonCode === undefined ? {} : { reasonCode }), ...(phoneNumber ? { phoneNumber } : {}) };
+    this.emit("provider.lifecycle", this.lifecycleSnapshot);
+  }
+
   public globalVendorArgs: BaileyGlobalVendorArgs = {
     name: `bot`,
     gifPlayback: false,
@@ -349,33 +408,45 @@ class BaileysProvider extends ProviderClass<WASocket> {
         req["globalVendorArgs"] = this.globalVendorArgs;
         return next();
       })
+      .get("/qr/metadata", this.qrMetadata)
       .get("/", this.indexHome);
   }
 
   protected afterHttpServerInit(): void { }
 
+  public qrMetadata: polka.Middleware = (_req, res) => {
+    const current = this.qrChallenges.current();
+    res.writeHead(200, { "Cache-Control": "private, no-store", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ instanceId: this.qrInstanceId, available: Boolean(current), ...(current ? {
+      generation: current.socketGeneration, revision: current.revision,
+      expiresAt: new Date(current.expiresAt).toISOString(),
+    } : {}) }));
+  };
+
   public indexHome: polka.Middleware = (req, res) => {
-    try {
-      const botName = req[this.idBotName];
-      const qrPath = join(process.cwd(), `${botName}.qr.png`);
-      const fileStream = createReadStream(qrPath);
-      res.writeHead(200, { "Content-Type": "image/png" });
-      fileStream.pipe(res);
-    } catch (e) {
-      res.writeHead(404, { "Content-Type": "text/html" });
-      res.end(`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta http-equiv="refresh" content="5">
-                    <title>QR Not Ready</title>
-                </head>
-                <body>
-                    <p>QR code is not ready yet. The page will automatically refresh in 5 seconds.</p>
-                </body>
-                </html>
-            `);
+    const current = this.qrChallenges.current();
+    const headers = { "Cache-Control": "private, no-store" };
+    const query = req.query || {};
+    const conditional = [query.qrInstanceId, query.qrGeneration, query.qrRevision].some(value => value !== undefined);
+    if (conditional && (!current || query.qrInstanceId !== this.qrInstanceId || String(query.qrGeneration) !== String(current.socketGeneration) || String(query.qrRevision) !== String(current.revision))) {
+      res.writeHead(409, { ...headers, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ state: "qr_changed" }));
+      return;
     }
+    if (!current) {
+      res.writeHead(503, { ...headers, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ state: "waiting_qr" }));
+      return;
+    }
+    res.writeHead(200, {
+      ...headers,
+      "Content-Type": "image/png",
+      "X-QR-Instance-Id": this.qrInstanceId,
+      "X-QR-Generation": String(current.socketGeneration),
+      "X-QR-Revision": String(current.revision),
+      "X-QR-Expires-At": new Date(current.expiresAt).toISOString(),
+    });
+    res.end(current.image);
   };
 
   protected getMessage = async (key: { remoteJid: string; id: string }) => {
@@ -389,8 +460,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
    * Iniciar todo Bailey
    */
   protected initVendor = async () => {
+    if (this.lifecycleStopped) return;
+    const socketGeneration = ++this.socketGeneration;
+    this.lifecycleSnapshot = null;
+    this.qrChallenges.invalidate(socketGeneration);
     const NAME_DIR_SESSION = `${this.globalVendorArgs.name}_sessions`;
     const { state, saveCreds } = await useMultiFileAuthState(NAME_DIR_SESSION);
+    if (socketGeneration !== this.socketGeneration) return;
     const hasLinkedIdentity =
       Boolean(state.creds.registered) || Boolean(state.creds.me?.id);
     // Lo guardamos porque `delayedReconnect` necesita distinguir onboarding por
@@ -417,6 +493,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       this.initVendor().then((v) => this.listenOnEvents(v));
     }
 
+    if (socketGeneration !== this.socketGeneration || this.lifecycleStopped) return;
     try {
       const sock = makeWASocketOther({
         logger: loggerBaileys,
@@ -447,6 +524,21 @@ class BaileysProvider extends ProviderClass<WASocket> {
         ...this.globalVendorArgs,
       });
 
+      const sendMessage = sock.sendMessage?.bind(sock);
+      if (sendMessage) {
+        sock.sendMessage = (async (...args: Parameters<WASocket["sendMessage"]>) => {
+          this.assertSocketCurrent(socketGeneration);
+          await this.lifecycleGuard?.();
+          this.assertSocketCurrent(socketGeneration);
+          const network = async () => {
+            this.assertSocketCurrent(socketGeneration);
+            return sendMessage(...args);
+          };
+          return this.lifecycleSendWrapper
+            ? this.lifecycleSendWrapper({ to: args[0], content: args[1], options: args[2] }, network)
+            : network();
+        }) as WASocket["sendMessage"];
+      }
       this.vendor = sock;
       if (
         this.globalVendorArgs.usePairingCode &&
@@ -483,6 +575,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
           qr: any;
           receivedPendingNotifications?: boolean;
         }) => {
+          if (socketGeneration !== this.socketGeneration) return;
           const {
             connection,
             lastDisconnect,
@@ -498,8 +591,12 @@ class BaileysProvider extends ProviderClass<WASocket> {
             ?.statusCode;
           const reason = lastDisconnect?.error?.message;
 
+          if (connection === "connecting") this.reportLifecycle("connecting");
+
           /** Connection closed for various reasons */
           if (connection === "close") {
+            this.qrChallenges.invalidate(socketGeneration);
+            this.reportLifecycle("disconnected", statusCode);
             this.logger.log(
               `[${new Date().toISOString()}] Connection closed. Status: ${statusCode}, Reason: ${reason}`
             );
@@ -542,6 +639,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
           /** Connection opened successfully */
           if (connection === "open") {
+            this.qrChallenges.invalidate(socketGeneration);
+            const linkedId = sock?.user?.id;
+            const linkedPhone = linkedId?.endsWith("@s.whatsapp.net") ? linkedId.split(/[:@]/)[0] : undefined;
+            this.reportLifecycle("ready", undefined, linkedPhone);
             this.logger.log(
               `[${new Date().toISOString()}] Connection opened successfully`
             );
@@ -560,32 +661,31 @@ class BaileysProvider extends ProviderClass<WASocket> {
             this.offlineReplayWindow.complete();
           }
 
-          /** QR Code */
-          if (qr && !this.globalVendorArgs.usePairingCode) {
-            this.logger.log(`[${new Date().toISOString()}] QR Code received`);
+          /** Publish only the current fully rendered challenge; never log its payload. */
+          if (qr && !this.globalVendorArgs.usePairingCode && this.lifecycleSnapshot?.state !== "ready") {
+            const ttl = Number((this.globalVendorArgs as any).qrTimeout) || 40_000;
+            const artifact = await this.qrChallenges.publish(qr, socketGeneration, ttl);
+            if (!artifact) return;
+            this.reportLifecycle("requires_link");
             this.emit("require_action", {
-              title: "⚡⚡ ACTION REQUIRED ⚡⚡",
-              instructions: [
-                `You must scan the QR Code`,
-                `Remember that the QR code updates every minute`,
-                `Need help: https://link.codigoencasa.com/DISCORD`,
-              ],
+              title: "ACTION REQUIRED",
+              instructions: ["Scan the current QR code before its displayed expiry."],
               payload: { qr },
             });
-            await baileyGenerateImage(
-              qr,
-              `${this.globalVendorArgs.name}.qr.png`
-            );
           }
         }
       );
 
       sock.ev.on("creds.update", async () => {
+        if (socketGeneration !== this.socketGeneration) return;
         await saveCreds();
       });
 
       return sock.ev;
     } catch (e) {
+      if (socketGeneration !== this.socketGeneration) return;
+      this.qrChallenges.invalidate(socketGeneration);
+      this.reportLifecycle("error");
       this.logger.log(e);
       this.emit("auth_failure", [
         `Something unexpected has occurred, do not panic`,
@@ -608,6 +708,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       {
         event: "messages.upsert",
         func: async (argFromProvider) => {
+          if (this.lifecycleStopped) return;
           const { messages, type } = argFromProvider as {
             type: MessageUpsertType;
             messages: WAMessage[];
@@ -870,9 +971,15 @@ class BaileysProvider extends ProviderClass<WASocket> {
               return true;
             };
 
-            if (processDuplicate()) {
+            // Admission owns this synchronous callback: no await may separate final
+            // local protocol validation from dedup and business listener handoff.
+            const dispatch = () => {
+              if (this.lifecycleStopped || !processDuplicate()) return false;
               this.emit("message", payload);
-            }
+              return true;
+            };
+            if (this.lifecycleIncomingGate) await this.lifecycleIncomingGate(payload, dispatch);
+            else dispatch();
           }
         },
       },
@@ -935,7 +1042,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
                   voters: pollCreation,
                   type: "poll",
                 };
-                this.emit("message", payload);
+                const dispatch = () => { if (this.lifecycleStopped) return false; this.emit("message", payload); return true; };
+                if (this.lifecycleIncomingGate) await this.lifecycleIncomingGate(payload, dispatch);
+                else dispatch();
               }
             }
           }
@@ -951,7 +1060,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
               call,
             };
 
-            this.emit("message", payload);
+            const dispatch = () => { if (this.lifecycleStopped) return false; this.emit("message", payload); return true; };
+            if (this.lifecycleIncomingGate) await this.lifecycleIncomingGate(payload, dispatch);
+            else dispatch();
             // Opcional: Rechazar automáticamente la llamada
             // await this.vendor.rejectCall(call.id, call.from)
           }
@@ -1471,6 +1582,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
    * intacta en disco. Si PM2 no estuviera, ECS reemplaza la task.
    */
   private giveUpAndExit(reason: string): void {
+    this.qrChallenges.invalidate(this.socketGeneration);
+    this.reportLifecycle("error");
     this.logger.log(
       `[${new Date().toISOString()}] ${reason}. Terminando el proceso para forzar un arranque limpio.`
     );
@@ -1506,6 +1619,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
   }
 
   private async delayedReconnect(): Promise<void> {
+    if (this.lifecycleStopped) return;
     const now = Date.now();
     if (this.reconnectWindowStartedAt === null) {
       this.reconnectWindowStartedAt = now;
@@ -1557,7 +1671,9 @@ class BaileysProvider extends ProviderClass<WASocket> {
       }/${budget} in ${delay}ms (elapsed ${Math.round(elapsedMs / 1000)}s)`
     );
 
-    setTimeout(async () => {
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.lifecycleStopped) return;
       try {
         this.initVendor().then((v) => this.listenOnEvents(v));
       } catch (error) {
