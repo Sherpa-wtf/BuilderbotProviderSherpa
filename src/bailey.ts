@@ -129,6 +129,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
   public setLifecycleSendWrapper(wrapper: (descriptor: unknown, network: () => Promise<any>) => Promise<any>): void { this.lifecycleSendWrapper = wrapper; }
   private lifecycleIncomingGate: ((payload: any, dispatch: () => boolean) => Promise<boolean>) | null = null;
   public setLifecycleIncomingGate(gate: (payload: any, dispatch: () => boolean) => Promise<boolean>): void { this.lifecycleIncomingGate = gate; }
+  private lifecycleQrGuard: ((query: Record<string, unknown>) => Promise<void>) | null = null;
+  public setLifecycleQrGuard(guard: (query: Record<string, unknown>) => Promise<void>): void { this.lifecycleQrGuard = guard; }
   private lifecycleGuard: (() => Promise<void>) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   public setLifecycleGuard(guard: () => Promise<void>): void { this.lifecycleGuard = guard; }
@@ -419,7 +421,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
 
   protected afterHttpServerInit(): void { }
 
-  public qrMetadata: polka.Middleware = (_req, res) => {
+  public qrMetadata: polka.Middleware = async (req, res) => {
+    if (this.lifecycleQrGuard) {
+      try { await this.lifecycleQrGuard(req.query || {}); } catch {
+        res.writeHead(409, { "Cache-Control": "private, no-store", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ state: "qr_unavailable" })); return;
+      }
+    }
     const current = this.qrChallenges.current();
     res.writeHead(200, { "Cache-Control": "private, no-store", "Content-Type": "application/json" });
     res.end(JSON.stringify({ instanceId: this.qrInstanceId, available: Boolean(current), ...(current ? {
@@ -428,7 +436,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
     } : {}) }));
   };
 
-  public indexHome: polka.Middleware = (req, res) => {
+  public indexHome: polka.Middleware = async (req, res) => {
+    if (this.lifecycleQrGuard) {
+      try { await this.lifecycleQrGuard(req.query || {}); } catch {
+        res.writeHead(409, { "Cache-Control": "private, no-store", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ state: "qr_unavailable" })); return;
+      }
+    }
     const current = this.qrChallenges.current();
     const headers = { "Cache-Control": "private, no-store" };
     const query = req.query || {};

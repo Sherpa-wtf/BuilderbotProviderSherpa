@@ -275,4 +275,22 @@ describe('provider lifecycle and current QR only', () => {
     expect(send).not.toHaveBeenCalled()
   })
 
+  test('fresh migration QR guard fences metadata and image before disclosing a challenge', async () => {
+    await (provider as any).initVendor()
+    provider.vendor.ev.emit('connection.update', { qr: 'migration-qr' })
+    await flush()
+    const guard = jest.fn(async (query: any) => { if(query.operationId !== 'op' || query.controlVersion !== '2') throw new Error('revoked') })
+    ;(provider as any).setLifecycleQrGuard(guard)
+    const rejected = response()
+    await provider.indexHome({ query: { operationId: 'old', controlVersion: '1' } } as any, rejected as any, jest.fn())
+    expect(rejected.writeHead).toHaveBeenCalledWith(409, expect.anything())
+    expect(Buffer.isBuffer(rejected.end.mock.calls[0][0])).toBe(false)
+    const metadata = response()
+    await (provider as any).qrMetadata({ query: { operationId: 'old' } }, metadata)
+    expect(metadata.writeHead).toHaveBeenCalledWith(409, expect.anything())
+    const accepted = response()
+    await provider.indexHome({ query: { operationId: 'op', controlVersion: '2' } } as any, accepted as any, jest.fn())
+    expect(accepted.writeHead).toHaveBeenCalledWith(200, expect.anything())
+  })
+
 })
