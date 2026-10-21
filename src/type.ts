@@ -11,6 +11,8 @@ export interface BaileyGlobalVendorArgs extends GlobalVendorArgs {
     timeRelease?: number
     experimentalStore?: boolean
     offlineReplayEnabled?: boolean
+    /** Silencio tras `receivedPendingNotifications` antes de cerrar la ventana de replay. */
+    offlineReplayQuietMs?: number
     groupsIgnore: boolean
     readStatus: boolean
     version?: WAVersion //

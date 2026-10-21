@@ -244,8 +244,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
   constructor(args: Partial<BaileyGlobalVendorArgs>) {
     super();
 
-    this.offlineReplayWindow = new OfflineReplayWindow((event, payload) =>
-      this.emit(event, payload)
+    this.offlineReplayWindow = new OfflineReplayWindow(
+      (event, payload) => this.emit(event, payload),
+      undefined,
+      {
+        quietMs: args?.offlineReplayQuietMs,
+        log: (line) => this.logger?.log(`[${new Date().toISOString()}] ${line}`),
+      }
     );
 
     this.logStream = createWriteStream(`${process.cwd()}/baileys.log`, {
@@ -676,8 +681,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
             this.emit("host", host);
           }
 
+          // El flag llega con nodos offline todavia en cola: la ventana cierra
+          // por silencio, no aca (ver OfflineReplayWindow).
           if (receivedPendingNotifications === true) {
-            this.offlineReplayWindow.complete();
+            this.offlineReplayWindow.pendingNotificationsReceived();
           }
 
           /** Publish only the current fully rendered challenge; never log its payload. */
@@ -716,6 +723,46 @@ class BaileysProvider extends ProviderClass<WASocket> {
   };
 
   /**
+   * Un `append` ajeno es un mensaje que WhatsApp tenia guardado mientras el
+   * socket estaba caido. Baileys ya lo confirmo, asi que si se descarta aca no
+   * vuelve nunca. Con la ventana cerrada se reabre una tardia en vez de
+   * perderlo; lo que no se puede reenviar queda al menos logueado con su id.
+   */
+  private routeOfflineAppend(message: WAMessage): void {
+    const messageId = message?.key?.id;
+    if (this.offlineReplayWindow.isActive()) {
+      this.offlineReplayWindow.capture(message, "append");
+      return;
+    }
+
+    const remoteJid = message?.key?.remoteJid ?? "";
+    let motivo: string | null = null;
+    if (this.globalVendorArgs.offlineReplayEnabled !== true) {
+      motivo = "replay_deshabilitado";
+    } else if (!message?.message || message?.messageStubType) {
+      motivo = "sin_contenido";
+    } else if (
+      isJidGroup(remoteJid) ||
+      isJidBroadcast(remoteJid) ||
+      remoteJid.endsWith("@newsletter")
+    ) {
+      motivo = "chat_no_individual";
+    }
+    if (motivo) {
+      this.logger.log(
+        `[${new Date().toISOString()}] [BAILEYS_APPEND_SIN_VENTANA] id=${messageId} motivo=${motivo}`
+      );
+      return;
+    }
+
+    if (this.offlineReplayWindow.captureOffline(message) === "reopened") {
+      this.logger.log(
+        `[${new Date().toISOString()}] [BAILEYS_APPEND_TARDIO] id=${messageId} ventana_tardia=si`
+      );
+    }
+  }
+
+  /**
    * Map native events that the Provider class expects
    * to have a standard set of events
    * @returns
@@ -736,7 +783,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
             for (const message of messages || []) {
               if (message?.key?.fromMe) continue;
               if (!message?.key?.id) continue;
-              this.offlineReplayWindow.capture(message, "append");
+              this.routeOfflineAppend(message);
             }
             return;
           }
@@ -796,7 +843,18 @@ class BaileysProvider extends ProviderClass<WASocket> {
             }
 
             if (
-              this.offlineReplayWindow.isActive() &&
+              !messageCtx?.key?.fromMe &&
+              this.offlineReplayWindow.wasCaptured(messageCtx?.key?.id)
+            ) {
+              // Ya viajo por el replay (y de ahi al CRM): reemitirlo lo duplica.
+              this.logger.log(
+                `[${new Date().toISOString()}] [BAILEYS_NOTIFY_YA_REENVIADO_POR_REPLAY] id=${messageCtx?.key?.id}`
+              );
+              continue;
+            }
+
+            if (
+              this.offlineReplayWindow.capturesLiveNotify() &&
               !messageCtx?.key?.fromMe
             ) {
               if (messageCtx?.key?.id) {

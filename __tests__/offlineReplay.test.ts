@@ -1,4 +1,4 @@
-import { describe, expect, jest, test } from '@jest/globals'
+import { afterEach, describe, expect, jest, test } from '@jest/globals'
 
 import {
     OFFLINE_REPLAY_COMPLETE_EVENT,
@@ -75,5 +75,147 @@ describe('OfflineReplayWindow', () => {
         replay.capture({ key: { id: 'outside-window' } } as any)
 
         expect(emit).not.toHaveBeenCalled()
+    })
+
+    describe('cierre por silencio tras receivedPendingNotifications', () => {
+        // Caso Cazala (bot 69310d0372d5565f8fefd5f9, 2026-10-13): Baileys emite el
+        // flag apenas llega el marcador `offline`, con nodos offline todavia en
+        // cola. Los `append` procesados despues del flag se perdian.
+        afterEach(() => jest.useRealTimers())
+
+        test('captura los append que llegan despues del flag y cierra recien tras el silencio', () => {
+            jest.useFakeTimers()
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 1_000, { quietMs: 5_000 })
+
+            const window = replay.open(true)
+            replay.capture({ key: { id: '3AAB-antes' } } as any, 'append')
+            replay.pendingNotificationsReceived()
+            replay.capture({ key: { id: '3AABD677B3B81E657D81' } } as any, 'append')
+            jest.advanceTimersByTime(4_999)
+            replay.capture({ key: { id: '4A7AB9FFB1A20A27B02C' } } as any, 'append')
+            jest.advanceTimersByTime(4_999)
+
+            expect(replay.isActive()).toBe(true)
+            expect(emit).not.toHaveBeenCalledWith(OFFLINE_REPLAY_COMPLETE_EVENT, expect.anything())
+
+            jest.advanceTimersByTime(1)
+
+            expect(emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ windowId: window?.windowId, sequence: 3, messageId: '4A7AB9FFB1A20A27B02C' })
+            )
+            expect(emit).toHaveBeenLastCalledWith(OFFLINE_REPLAY_COMPLETE_EVENT, {
+                windowId: window?.windowId,
+                reconnectStartedAt: 1_000,
+                messageCount: 3,
+            })
+            expect(replay.isActive()).toBe(false)
+        })
+
+        test('deja de retener notify en vivo apenas llega el flag', () => {
+            jest.useFakeTimers()
+            const replay = new OfflineReplayWindow(jest.fn(), () => 1_000, { quietMs: 5_000 })
+
+            replay.open(true)
+            expect(replay.capturesLiveNotify()).toBe(true)
+
+            replay.pendingNotificationsReceived()
+
+            expect(replay.isActive()).toBe(true)
+            expect(replay.capturesLiveNotify()).toBe(false)
+        })
+
+        test('el flag sin ventana activa no hace nada', () => {
+            jest.useFakeTimers()
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 1_000, { quietMs: 5_000 })
+
+            replay.pendingNotificationsReceived()
+            jest.advanceTimersByTime(10_000)
+
+            expect(emit).not.toHaveBeenCalled()
+        })
+
+        test('abrir una ventana nueva cancela el cierre programado de la anterior', () => {
+            jest.useFakeTimers()
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 1_000, { quietMs: 5_000 })
+
+            replay.open(true)
+            replay.pendingNotificationsReceived()
+            replay.open(true)
+            jest.advanceTimersByTime(10_000)
+
+            expect(replay.isActive()).toBe(true)
+            expect(emit).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('append tardio sin ventana activa', () => {
+        afterEach(() => jest.useRealTimers())
+
+        test('reabre una ventana tardia, emite el mensaje y la cierra por silencio', () => {
+            jest.useFakeTimers()
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 2_000, { quietMs: 5_000 })
+
+            const result = replay.captureOffline({ key: { id: 'tardio-1' }, messageTimestamp: 1_990 } as any)
+
+            expect(result).toBe('reopened')
+            expect(emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'tardio-1', sequence: 1, reconnectStartedAt: 2_000, upsertType: 'append' })
+            )
+            expect(replay.capturesLiveNotify()).toBe(false)
+
+            jest.advanceTimersByTime(5_000)
+
+            expect(emit).toHaveBeenLastCalledWith(
+                OFFLINE_REPLAY_COMPLETE_EVENT,
+                expect.objectContaining({ messageCount: 1, reconnectStartedAt: 2_000 })
+            )
+        })
+
+        test('con ventana activa captura en la misma ventana', () => {
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 2_000, { quietMs: 5_000 })
+
+            const window = replay.open(true)
+
+            expect(replay.captureOffline({ key: { id: 'en-ventana' } } as any)).toBe('captured')
+            expect(emit).toHaveBeenCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ windowId: window?.windowId, messageId: 'en-ventana' })
+            )
+        })
+
+        test('no reemite un id ya capturado en una ventana anterior', () => {
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 2_000, { quietMs: 5_000 })
+
+            replay.open(true)
+            replay.capture({ key: { id: 'repetido' } } as any, 'append')
+            replay.complete()
+            emit.mockClear()
+
+            expect(replay.captureOffline({ key: { id: 'repetido' } } as any)).toBe('duplicate')
+            expect(replay.wasCaptured('repetido')).toBe(true)
+            expect(emit).not.toHaveBeenCalled()
+            expect(replay.isActive()).toBe(false)
+        })
+
+        test('recuerda una cantidad acotada de ids', () => {
+            const replay = new OfflineReplayWindow(jest.fn(), () => 2_000, { quietMs: 5_000, maxRememberedIds: 2 })
+
+            replay.open(true)
+            replay.capture({ key: { id: 'a' } } as any)
+            replay.capture({ key: { id: 'b' } } as any)
+            replay.capture({ key: { id: 'c' } } as any)
+
+            expect(replay.wasCaptured('a')).toBe(false)
+            expect(replay.wasCaptured('b')).toBe(true)
+            expect(replay.wasCaptured('c')).toBe(true)
+        })
     })
 })
