@@ -1000,6 +1000,25 @@ describe('#BaileysProvider', () => {
                 expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/BAILEYS_APPEND_SIN_VENTANA.*sin-replay-1/))
             })
 
+            test('un stub sin contenido en replay no bloquea el notify descifrado con el mismo id', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)
+                provider.globalVendorArgs.offlineReplayEnabled = true
+                provider['offlineReplayWindow'].open(true)
+
+                await provider['busEvents']()[0].func({
+                    messages: [appendMessage('reintento-1', { message: undefined, messageStubType: 2 })],
+                    type: 'append',
+                })
+                provider['offlineReplayWindow'].complete()
+                await provider['busEvents']()[0].func({ messages: [appendMessage('reintento-1')], type: 'notify' })
+
+                expect(provider.emit).toHaveBeenCalledWith(
+                    'message',
+                    expect.objectContaining({ key: expect.objectContaining({ id: 'reintento-1' }) })
+                )
+            })
+
             test('un notify con el mismo id que un append ya reenviado por replay no se duplica', async () => {
                 ;(provider.emit as jest.Mock).mockClear()
                 ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)

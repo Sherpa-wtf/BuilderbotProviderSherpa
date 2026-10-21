@@ -205,6 +205,15 @@ describe('OfflineReplayWindow', () => {
             expect(replay.isActive()).toBe(false)
         })
 
+        test('no recuerda stubs sin contenido: el reintento descifrado tiene el mismo id', () => {
+            const replay = new OfflineReplayWindow(jest.fn(), () => 2_000, { quietMs: 5_000 })
+
+            replay.open(true)
+            replay.capture({ key: { id: 'cifrado-1' }, messageStubType: 2 } as any, 'append')
+
+            expect(replay.wasCaptured('cifrado-1')).toBe(false)
+        })
+
         test('recuerda una cantidad acotada de ids', () => {
             const replay = new OfflineReplayWindow(jest.fn(), () => 2_000, { quietMs: 5_000, maxRememberedIds: 2 })
 

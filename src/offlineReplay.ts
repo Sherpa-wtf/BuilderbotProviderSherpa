@@ -115,7 +115,9 @@ export class OfflineReplayWindow {
 
         const messageId = message?.key?.id ?? null
         if (messageId && this.rememberedIds.has(messageId)) return false
-        if (messageId) this.remember(messageId)
+        // Un stub (p. ej. descifrado fallido) se reentrega despues con el mismo
+        // id y el contenido real: recordarlo bloquearia ese reintento.
+        if (messageId && !message?.messageStubType) this.remember(messageId)
 
         this.active.sequence += 1
         this.active.messageCount += 1
