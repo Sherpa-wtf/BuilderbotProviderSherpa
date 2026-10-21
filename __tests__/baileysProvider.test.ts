@@ -1,11 +1,11 @@
-import { beforeEach, describe, expect, jest, test } from '@jest/globals'
+import { afterEach, beforeEach, describe, expect, jest, test } from '@jest/globals'
 import { BaileysProvider } from '../src'
 import path from 'path'
 import { IStickerOptions } from 'wa-sticker-formatter'
 import fs from 'fs'
 import mime from 'mime-types'
 import { utils } from '@builderbot/bot'
-import { useMultiFileAuthState } from '../src/baileyWrapper'
+import { makeWASocketOther, useMultiFileAuthState } from '../src/baileyWrapper'
 import {
     OFFLINE_REPLAY_COMPLETE_EVENT,
     OFFLINE_REPLAY_MESSAGE_EVENT,
@@ -940,6 +940,100 @@ describe('#BaileysProvider', () => {
             expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
         })
 
+        describe('append sin ventana activa (caso Cazala)', () => {
+            const appendMessage = (id: string, extra: Record<string, unknown> = {}) => ({
+                key: { id, remoteJid: '1234567890@s.whatsapp.net', fromMe: false },
+                messageTimestamp: 1_000,
+                message: { conversation: `mensaje ${id}` },
+                ...extra,
+            })
+
+            afterEach(() => provider['offlineReplayWindow'].open(false))
+
+            test('con replay habilitado lo manda a una ventana tardia y lo loguea con su id', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                provider.globalVendorArgs.offlineReplayEnabled = true
+                const logSpy = jest.spyOn(provider['logger'], 'log').mockImplementation(() => undefined)
+
+                await provider['busEvents']()[0].func({
+                    messages: [appendMessage('3AABD677B3B81E657D81')],
+                    type: 'append',
+                })
+
+                expect(provider.emit).toHaveBeenCalledWith(
+                    OFFLINE_REPLAY_MESSAGE_EVENT,
+                    expect.objectContaining({ messageId: '3AABD677B3B81E657D81', upsertType: 'append' })
+                )
+                expect(logSpy).toHaveBeenCalledWith(
+                    expect.stringMatching(/BAILEYS_APPEND_TARDIO.*3AABD677B3B81E657D81/)
+                )
+            })
+
+            test('con replay habilitado no reabre por stubs ni grupos, pero lo loguea', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                provider.globalVendorArgs.offlineReplayEnabled = true
+                const logSpy = jest.spyOn(provider['logger'], 'log').mockImplementation(() => undefined)
+
+                await provider['busEvents']()[0].func({
+                    messages: [
+                        appendMessage('stub-llamada', { message: undefined, messageStubType: 40 }),
+                        appendMessage('grupo-1', { key: { id: 'grupo-1', remoteJid: '123@g.us', fromMe: false } }),
+                    ],
+                    type: 'append',
+                })
+
+                expect(provider.emit).not.toHaveBeenCalled()
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/BAILEYS_APPEND_SIN_VENTANA.*stub-llamada/))
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/BAILEYS_APPEND_SIN_VENTANA.*grupo-1/))
+            })
+
+            test('con replay deshabilitado no lo emite, pero deja rastro con su id', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                const logSpy = jest.spyOn(provider['logger'], 'log').mockImplementation(() => undefined)
+
+                await provider['busEvents']()[0].func({
+                    messages: [appendMessage('sin-replay-1')],
+                    type: 'append',
+                })
+
+                expect(provider.emit).not.toHaveBeenCalled()
+                expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/BAILEYS_APPEND_SIN_VENTANA.*sin-replay-1/))
+            })
+
+            test('un stub sin contenido en replay no bloquea el notify descifrado con el mismo id', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)
+                provider.globalVendorArgs.offlineReplayEnabled = true
+                provider['offlineReplayWindow'].open(true)
+
+                await provider['busEvents']()[0].func({
+                    messages: [appendMessage('reintento-1', { message: undefined, messageStubType: 2 })],
+                    type: 'append',
+                })
+                provider['offlineReplayWindow'].complete()
+                await provider['busEvents']()[0].func({ messages: [appendMessage('reintento-1')], type: 'notify' })
+
+                expect(provider.emit).toHaveBeenCalledWith(
+                    'message',
+                    expect.objectContaining({ key: expect.objectContaining({ id: 'reintento-1' }) })
+                )
+            })
+
+            test('un notify con el mismo id que un append ya reenviado por replay no se duplica', async () => {
+                ;(provider.emit as jest.Mock).mockClear()
+                ;(require('../src/utils').baileyIsValidNumber as jest.Mock).mockReturnValue(true)
+                provider.globalVendorArgs.offlineReplayEnabled = true
+                provider['offlineReplayWindow'].open(true)
+                const message = appendMessage('append-luego-notify')
+
+                await provider['busEvents']()[0].func({ messages: [message], type: 'append' })
+                provider['offlineReplayWindow'].complete()
+                await provider['busEvents']()[0].func({ messages: [message], type: 'notify' })
+
+                expect(provider.emit).not.toHaveBeenCalledWith('message', expect.anything())
+            })
+        })
+
         test('Should return undefine if the type is different from notify', async () => {
             // Arrange
             const message = {
@@ -1312,6 +1406,28 @@ describe('#BaileysProvider', () => {
         })
     })
 
+    describe('cierre de la ventana de replay al cortar el lifecycle', () => {
+        afterEach(() => jest.useRealTimers())
+
+        test.each([
+            ['stopLifecycle'],
+            ['recoverLifecycle'],
+        ])('%s cancela el cierre por silencio sin emitir complete', (method) => {
+            jest.useFakeTimers()
+            provider.vendor = { end: jest.fn() } as any
+            provider['delayedReconnect'] = jest.fn(async () => undefined) as any
+            provider['offlineReplayWindow'].open(true)
+            provider['offlineReplayWindow'].pendingNotificationsReceived()
+            ;(provider.emit as jest.Mock).mockClear()
+
+            ;(provider as any)[method]()
+            jest.advanceTimersByTime(10_000)
+
+            expect(provider['offlineReplayWindow'].isActive()).toBe(false)
+            expect(provider.emit).not.toHaveBeenCalledWith(OFFLINE_REPLAY_COMPLETE_EVENT, expect.anything())
+        })
+    })
+
     describe('#indexHome', () => {
         test('sends the current published artifact, not a persisted filename', () => {
             const image = Buffer.from('current-png')
@@ -1345,6 +1461,54 @@ describe('#BaileysProvider', () => {
             await provider['initVendor']()
 
             expect(openReplaySpy).toHaveBeenCalledWith(true)
+        })
+
+        test('el flag receivedPendingNotifications no cierra la ventana: los append posteriores entran en ella', async () => {
+            ;(useMultiFileAuthState as jest.MockedFunction<typeof useMultiFileAuthState>).mockResolvedValueOnce({
+                state: {
+                    creds: { registered: true, me: { id: '1234567890:1@s.whatsapp.net', name: 'test-bot' } },
+                    keys: {},
+                } as any,
+                saveCreds: jest.fn(async () => undefined),
+            })
+            provider.globalVendorArgs.offlineReplayEnabled = true
+            // El mock de baileyWrapper no trae el key store; sin el, initVendor
+            // cae al catch antes de registrar los listeners del socket.
+            const wrapper = require('../src/baileyWrapper')
+            wrapper.makeCacheableSignalKeyStore = jest.fn()
+            await provider['initVendor']()
+            const sock = (makeWASocketOther as jest.Mock).mock.results.at(-1)?.value as any
+            const onConnectionUpdate = sock.ev.on.mock.calls.find(
+                ([event]: [string]) => event === 'connection.update'
+            )[1]
+            const upsert = provider['busEvents']()[0].func
+            const appendMessage = (id: string) => ({
+                key: { id, remoteJid: '1234567890@s.whatsapp.net', fromMe: false },
+                messageTimestamp: 1_000,
+                message: { conversation: `mensaje ${id}` },
+            })
+            ;(provider.emit as jest.Mock).mockClear()
+
+            try {
+                await upsert({ messages: [appendMessage('3AAB-antes-del-flag')], type: 'append' })
+                await onConnectionUpdate({ receivedPendingNotifications: true })
+                await upsert({ messages: [appendMessage('3AABD677B3B81E657D81')], type: 'append' })
+                await upsert({ messages: [appendMessage('4A7AB9FFB1A20A27B02C')], type: 'append' })
+
+                const replayed = (provider.emit as jest.Mock).mock.calls
+                    .filter(([event]) => event === OFFLINE_REPLAY_MESSAGE_EVENT)
+                    .map(([, payload]) => payload as { messageId: string; windowId: string })
+                expect(replayed.map(({ messageId }) => messageId)).toEqual([
+                    '3AAB-antes-del-flag',
+                    '3AABD677B3B81E657D81',
+                    '4A7AB9FFB1A20A27B02C',
+                ])
+                expect(new Set(replayed.map(({ windowId }) => windowId)).size).toBe(1)
+                expect(provider.emit).not.toHaveBeenCalledWith(OFFLINE_REPLAY_COMPLETE_EVENT, expect.anything())
+            } finally {
+                provider['offlineReplayWindow'].open(false)
+                delete wrapper.makeCacheableSignalKeyStore
+            }
         })
 
         test('should initialize when useBaileysStore is true', async () => {
