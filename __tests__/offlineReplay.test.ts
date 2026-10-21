@@ -214,6 +214,73 @@ describe('OfflineReplayWindow', () => {
             expect(replay.wasCaptured('cifrado-1')).toBe(false)
         })
 
+        test('la ventana tardia hereda reconnectStartedAt de la conexion y no vuelve stale un mensaje del borde', () => {
+            jest.useFakeTimers()
+            let now = 10_000
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => now, { quietMs: 5_000 })
+
+            replay.startConnection(true)
+            replay.pendingNotificationsReceived()
+            jest.advanceTimersByTime(5_000)
+            now = 10_020
+            replay.captureOffline({ key: { id: 'borde-595s' }, messageTimestamp: 9_405, message: {} } as any)
+
+            // El consumer descarta lo que sea < reconnectStartedAt - 600.
+            expect(emit).toHaveBeenLastCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ messageId: 'borde-595s', reconnectStartedAt: 10_000 })
+            )
+        })
+
+        test('sin ventana principal en la conexion la tardia usa el momento en que arranco el socket', () => {
+            let now = 10_000
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => now, { quietMs: 5_000 })
+
+            replay.startConnection(false)
+            now = 10_020
+            replay.captureOffline({ key: { id: 'sin-principal' }, message: {} } as any)
+
+            expect(emit).toHaveBeenLastCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ reconnectStartedAt: 10_000 })
+            )
+        })
+
+        test('una ventana a demanda no corre el inicio de la conexion', () => {
+            let now = 10_000
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => now, { quietMs: 5_000 })
+
+            replay.startConnection(true)
+            replay.complete()
+            now = 10_300
+            replay.open(true)
+            replay.complete()
+            now = 10_320
+            replay.captureOffline({ key: { id: 'tras-demanda' }, message: {} } as any)
+
+            expect(emit).toHaveBeenLastCalledWith(
+                OFFLINE_REPLAY_MESSAGE_EVENT,
+                expect.objectContaining({ reconnectStartedAt: 10_000 })
+            )
+        })
+
+        test('cancel descarta la ventana y su cierre programado sin emitir complete', () => {
+            jest.useFakeTimers()
+            const emit = jest.fn()
+            const replay = new OfflineReplayWindow(emit, () => 1_000, { quietMs: 5_000 })
+
+            replay.open(true)
+            replay.pendingNotificationsReceived()
+            replay.cancel()
+            jest.advanceTimersByTime(10_000)
+
+            expect(replay.isActive()).toBe(false)
+            expect(emit).not.toHaveBeenCalled()
+        })
+
         test('recuerda una cantidad acotada de ids', () => {
             const replay = new OfflineReplayWindow(jest.fn(), () => 2_000, { quietMs: 5_000, maxRememberedIds: 2 })
 

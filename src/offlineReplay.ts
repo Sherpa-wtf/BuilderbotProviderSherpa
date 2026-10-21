@@ -60,6 +60,12 @@ export class OfflineReplayWindow {
     private active: OfflineReplayWindowState | null = null
     private pendingNotificationsFlushed = false
     private quietTimer: ReturnType<typeof setTimeout> | null = null
+    /**
+     * Inicio de la reconexion del socket actual. Una ventana tardia lo hereda:
+     * el consumer corta por antiguedad contra este valor, y tomar la hora de
+     * apertura de la tardia volveria stale un mensaje del borde de 10 min.
+     */
+    private connectionStartedAt: number | null = null
     /** Orden de insercion = orden de descarte cuando se llena. */
     private rememberedIds = new Set<string>()
     private readonly quietMs: number
@@ -78,13 +84,24 @@ export class OfflineReplayWindow {
             : DEFAULT_MAX_REMEMBERED_IDS
     }
 
+    /** Socket nuevo: fija el inicio de la reconexion y abre la ventana principal. */
+    startConnection(wasRegistered: boolean): OfflineReplayWindowState | null {
+        this.connectionStartedAt = this.nowSeconds()
+        return this.open(wasRegistered)
+    }
+
     open(wasRegistered: boolean): OfflineReplayWindowState | null {
-        this.cancelQuietTimer()
-        this.active = null
-        this.pendingNotificationsFlushed = false
+        this.cancel()
         if (!wasRegistered) return null
 
         return this.start()
+    }
+
+    /** Descarta la ventana y su cierre programado sin emitir complete. */
+    cancel(): void {
+        this.cancelQuietTimer()
+        this.active = null
+        this.pendingNotificationsFlushed = false
     }
 
     isActive(): boolean {
@@ -144,7 +161,7 @@ export class OfflineReplayWindow {
         if (this.wasCaptured(message?.key?.id)) return 'duplicate'
         if (this.active) return this.capture(message, 'append') ? 'captured' : 'duplicate'
 
-        this.start()
+        this.start(this.connectionStartedAt ?? undefined)
         this.pendingNotificationsFlushed = true
         this.capture(message, 'append')
         return 'reopened'
@@ -165,10 +182,10 @@ export class OfflineReplayWindow {
         return event
     }
 
-    private start(): OfflineReplayWindowState {
+    private start(reconnectStartedAt: number = this.nowSeconds()): OfflineReplayWindowState {
         this.active = {
             windowId: randomUUID(),
-            reconnectStartedAt: this.nowSeconds(),
+            reconnectStartedAt,
             sequence: 0,
             messageCount: 0,
         }

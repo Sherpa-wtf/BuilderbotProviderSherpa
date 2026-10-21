@@ -142,6 +142,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    // Sin esto el cierre por silencio emitia un complete hasta 5 s despues del stop.
+    this.offlineReplayWindow.cancel();
     this.vendor?.end(new Error("Intentional lifecycle stop"));
   }
 
@@ -152,6 +154,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.offlineReplayWindow.cancel();
     this.vendor?.end(new Error("Lifecycle ingress storage unavailable"));
     this.reportLifecycle("disconnected");
     void this.delayedReconnect();
@@ -496,7 +499,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // Lo guardamos porque `delayedReconnect` necesita distinguir onboarding por
     // QR de una reconexion con sesion ya vinculada: ver `giveUpAndExit`.
     this.sessionWasRegistered = hasLinkedIdentity;
-    this.offlineReplayWindow.open(
+    this.offlineReplayWindow.startConnection(
       hasLinkedIdentity && this.globalVendorArgs.offlineReplayEnabled === true
     );
     // `fatal` silenciaba toda la capa WebSocket de Baileys: cuando el socket se

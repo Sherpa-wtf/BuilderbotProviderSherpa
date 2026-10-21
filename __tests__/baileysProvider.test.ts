@@ -1406,6 +1406,28 @@ describe('#BaileysProvider', () => {
         })
     })
 
+    describe('cierre de la ventana de replay al cortar el lifecycle', () => {
+        afterEach(() => jest.useRealTimers())
+
+        test.each([
+            ['stopLifecycle'],
+            ['recoverLifecycle'],
+        ])('%s cancela el cierre por silencio sin emitir complete', (method) => {
+            jest.useFakeTimers()
+            provider.vendor = { end: jest.fn() } as any
+            provider['delayedReconnect'] = jest.fn(async () => undefined) as any
+            provider['offlineReplayWindow'].open(true)
+            provider['offlineReplayWindow'].pendingNotificationsReceived()
+            ;(provider.emit as jest.Mock).mockClear()
+
+            ;(provider as any)[method]()
+            jest.advanceTimersByTime(10_000)
+
+            expect(provider['offlineReplayWindow'].isActive()).toBe(false)
+            expect(provider.emit).not.toHaveBeenCalledWith(OFFLINE_REPLAY_COMPLETE_EVENT, expect.anything())
+        })
+    })
+
     describe('#indexHome', () => {
         test('sends the current published artifact, not a persisted filename', () => {
             const image = Buffer.from('current-png')
