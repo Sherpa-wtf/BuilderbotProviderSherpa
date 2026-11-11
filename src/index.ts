@@ -1,6 +1,7 @@
 import { baileyCleanNumber } from './utils'
 
 export * from './bailey'
+export * from './capabilities'
 export * from './offlineReplay'
 export { baileyCleanNumber }
 

@@ -18,4 +18,9 @@ export interface BaileyGlobalVendorArgs extends GlobalVendorArgs {
     version?: WAVersion //
     autoRefresh?: number
     host?: any
+    /**
+     * Si es true, ante `connectionReplaced` (440) el proceso termina con codigo 79
+     * en vez de reconectar. Por defecto false (comportamiento historico).
+     */
+    exitOnReplaced?: boolean
 }

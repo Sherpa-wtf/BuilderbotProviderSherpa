@@ -647,6 +647,18 @@ class BaileysProvider extends ProviderClass<WASocket> {
               return;
             }
 
+            // Sesion reemplazada (440): otra conexion tomo la sesion. Si el proceso
+            // corre dentro de un host con varios bots, reconectar pelearia la sesion
+            // con el nuevo dueno; se sale con un codigo propio y el supervisor no
+            // reinicia al hijo.
+            if (
+              statusCode === DisconnectReason.connectionReplaced &&
+              this.globalVendorArgs.exitOnReplaced === true
+            ) {
+              this.exitReplaced();
+              return;
+            }
+
             // Casos donde debemos reconectar con backoff
             if (this.shouldReconnect(statusCode)) {
               await this.delayedReconnect();
@@ -1674,6 +1686,19 @@ class BaileysProvider extends ProviderClass<WASocket> {
     ]);
     // Margen para que la linea llegue a stdout antes de morir.
     setTimeout(() => process.exit(1), 1000);
+  }
+
+  /**
+   * Termina el proceso con codigo 79 porque otra conexion tomo la sesion (440).
+   * Distinto de `giveUpAndExit` (codigo 1): el supervisor del host no reinicia
+   * este codigo, asi no hay dos duenos peleando la misma sesion.
+   */
+  private exitReplaced(): void {
+    this.logger.log(
+      `[${new Date().toISOString()}] [BAILEYS_SESION_REEMPLAZADA] Otra conexion tomo la sesion (440). No se reconecta; el proceso termina con codigo 79.`
+    );
+    // Margen para que la linea llegue a stdout antes de morir.
+    setTimeout(() => process.exit(79), 1000);
   }
 
   private shouldReconnect(statusCode: number): boolean {
