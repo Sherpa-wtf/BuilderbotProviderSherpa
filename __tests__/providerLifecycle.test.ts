@@ -203,6 +203,56 @@ describe('provider lifecycle and current QR only', () => {
     } finally { jest.clearAllTimers(); jest.useRealTimers() }
   })
 
+  describe('exitOnReplaced (codigo 440)', () => {
+    const replaced = { error: { output: { statusCode: 440 } } }
+
+    test('con la opcion activa informa disconnected, no reconecta y sale con codigo 79', async () => {
+      jest.useFakeTimers()
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      try {
+        const replacedProvider = new BaileysProvider({ name: 'lifecycle-test', exitOnReplaced: true } as any)
+        const reconnect = jest.spyOn(replacedProvider as any, 'delayedReconnect').mockResolvedValue(undefined)
+        const log = jest.spyOn((replacedProvider as any).logger, 'log')
+        const observed: any[] = []
+        replacedProvider.on('provider.lifecycle', event => observed.push(event))
+        await (replacedProvider as any).initVendor()
+        ;(replacedProvider.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: replaced })
+        await flush()
+        expect(observed[observed.length - 1]).toMatchObject({ state: 'disconnected', reasonCode: 440 })
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('[BAILEYS_SESION_REEMPLAZADA]'))
+        expect(reconnect).not.toHaveBeenCalled()
+        expect(exit).not.toHaveBeenCalled()
+        jest.advanceTimersByTime(1000)
+        expect(exit).toHaveBeenCalledWith(79)
+      } finally { jest.clearAllTimers(); jest.useRealTimers() }
+    })
+
+    test('sin la opcion el 440 sigue reconectando y no sale', async () => {
+      jest.useFakeTimers()
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      try {
+        const reconnect = (provider as any).delayedReconnect as jest.Mock
+        await (provider as any).initVendor()
+        ;(provider.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: replaced })
+        await flush()
+        jest.advanceTimersByTime(5000)
+        expect(reconnect).toHaveBeenCalledTimes(1)
+        expect(exit).not.toHaveBeenCalled()
+      } finally { jest.clearAllTimers(); jest.useRealTimers() }
+    })
+
+    test('con la opcion activa otros codigos siguen reconectando', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      const other = new BaileysProvider({ name: 'lifecycle-test', exitOnReplaced: true } as any)
+      const reconnect = jest.spyOn(other as any, 'delayedReconnect').mockResolvedValue(undefined)
+      await (other as any).initVendor()
+      ;(other.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } })
+      await flush()
+      expect(reconnect).toHaveBeenCalledTimes(1)
+      expect(exit).not.toHaveBeenCalled()
+    })
+  })
+
   test('a new socket may require QR even when the previous socket was ready', async () => {
     await (provider as any).initVendor()
     ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
