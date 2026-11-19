@@ -142,6 +142,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    if (this.forbiddenProbeTimer) clearTimeout(this.forbiddenProbeTimer);
+    this.forbiddenProbeTimer = null;
     // Sin esto el cierre por silencio emitia un complete hasta 5 s despues del stop.
     this.offlineReplayWindow.cancel();
     this.vendor?.end(new Error("Intentional lifecycle stop"));
@@ -150,6 +152,11 @@ class BaileysProvider extends ProviderClass<WASocket> {
   /** Authority/storage outage is transport recovery, never intentional pause or logout. */
   public recoverLifecycle(): void {
     if (this.lifecycleStopped) return;
+    // Con la cuenta rechazada no hay socket que recuperar: reconectar solo
+    // sumaria logins rechazados y taparia el "Con error" con "Reconectando".
+    // La prueba periodica de `scheduleForbiddenProbe` es la que vuelve a intentar.
+    // Durante esa prueba si hay un socket vivo, y la recuperacion se aplica normal.
+    if (this.forbiddenStopped && !this.forbiddenProbing) return;
     this.socketGeneration++;
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -208,6 +215,27 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 20;
   private reconnectDelay = 1000; // 1 segundo inicial
+
+  /** Codigo con el que WhatsApp rechaza el login de la cuenta (`DisconnectReason.forbidden`). */
+  private static readonly WHATSAPP_FORBIDDEN = 403;
+  /**
+   * Mensaje del Boom que arma Baileys para el nodo `<failure>` del servidor. Un
+   * 403 del handshake HTTP del WebSocket (un bloqueo de red o de IP) llega con
+   * otro mensaje y no es un rechazo de la cuenta: sigue la escalera normal.
+   */
+  private static readonly ACCOUNT_REJECTED_MESSAGE = "Connection Failure";
+  /** Rechazos seguidos, sin conexion abierta ni otro corte en el medio... */
+  private static readonly FORBIDDEN_MIN_STREAK = 3;
+  /** ...y repartidos en al menos este tiempo, para no confundir una rafaga con un bloqueo. */
+  private static readonly FORBIDDEN_MIN_SPAN_MS = 5 * 60 * 1000;
+  /** Ya detenido, cada cuanto se prueba un login (recupera solo si el numero vuelve). */
+  private static readonly FORBIDDEN_PROBE_MS = 6 * 60 * 60 * 1000;
+  private forbiddenStreak = 0;
+  private forbiddenSince: number | null = null;
+  private forbiddenStopped = false;
+  /** Hay un login de prueba en curso (socket vivo) mientras la cuenta sigue marcada como rechazada. */
+  private forbiddenProbing = false;
+  private forbiddenProbeTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * Techo duro de la escalera de reintentos. Con 20 intentos y el cap de 30s
@@ -628,6 +656,13 @@ class BaileysProvider extends ProviderClass<WASocket> {
               `[${new Date().toISOString()}] Connection closed. Status: ${statusCode}, Reason: ${reason}`
             );
 
+            // La racha solo cuenta rechazos de la cuenta seguidos: cualquier otro
+            // corte la corta (la conexion abierta la corta en el bloque "open").
+            const accountRejected =
+              statusCode === BaileysProvider.WHATSAPP_FORBIDDEN &&
+              reason === BaileysProvider.ACCOUNT_REJECTED_MESSAGE;
+            if (!accountRejected) this.resetForbiddenStreak();
+
             // Casos donde NO debemos reconectar
             if (statusCode === DisconnectReason.loggedOut) {
               this.logger.log(
@@ -643,6 +678,32 @@ class BaileysProvider extends ProviderClass<WASocket> {
               // Se borro la sesion: lo que viene es un onboarding por QR, no una
               // reconexion. Sin esto el primer reintento se contaria como acotado.
               this.sessionWasRegistered = false;
+              await this.delayedReconnect();
+              return;
+            }
+
+            // Cuenta rechazada (403 "Connection Failure"): el servidor de WhatsApp
+            // responde `<failure reason="403">` al login (Baileys: `forbidden`),
+            // tipicamente porque el numero esta bloqueado o restringido. Reintentar
+            // no lo arregla: antes recorria la escalera, salia con codigo 1 y el
+            // supervisor lo relanzaba para siempre (bot 6af5d66e, 16 al 19-nov:
+            // 12.811 logins rechazados y la app mostrando "Reconectando").
+            // Mientras la racha sea corta se reintenta con la escalera normal, por
+            // si es transitorio. Con 3 rechazos repartidos en 5 min (o ya detenido,
+            // en una prueba periodica) se informa `error` 403 y se deja de
+            // reconectar sin salir del proceso, asi el supervisor no lo relanza.
+            if (accountRejected) {
+              const now = Date.now();
+              this.forbiddenStreak += 1;
+              if (this.forbiddenSince === null) this.forbiddenSince = now;
+              if (
+                this.forbiddenStopped ||
+                (this.forbiddenStreak >= BaileysProvider.FORBIDDEN_MIN_STREAK &&
+                  now - this.forbiddenSince >= BaileysProvider.FORBIDDEN_MIN_SPAN_MS)
+              ) {
+                this.stopOnForbidden();
+                return;
+              }
               await this.delayedReconnect();
               return;
             }
@@ -686,6 +747,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
               `[${new Date().toISOString()}] Connection opened successfully`
             );
             this.reconnectAttempts = 0; // Reset counter on successful connection
+            this.resetForbiddenStreak();
             this.reconnectDelay = 1000; // Reset delay
             this.reconnectWindowStartedAt = null; // Arranca una racha nueva
 
@@ -1689,6 +1751,52 @@ class BaileysProvider extends ProviderClass<WASocket> {
   }
 
   /**
+   * WhatsApp rechazo el login de la cuenta varias veces seguidas (403). Se
+   * informa `error` con el codigo, que el backend muestra como "Con error", y
+   * se deja de reconectar sin terminar el proceso. A diferencia de lo que
+   * pasaba antes del 3-sep (un codigo desconocido dejaba el bot vivo y mudo
+   * figurando "Activo"), el estado queda informado de forma explicita.
+   */
+  private stopOnForbidden(): void {
+    this.forbiddenStopped = true;
+    this.forbiddenProbing = false;
+    this.qrChallenges.invalidate(this.socketGeneration);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reportLifecycle("error", BaileysProvider.WHATSAPP_FORBIDDEN);
+    this.logger.log(
+      `[${new Date().toISOString()}] [BAILEYS_CUENTA_RECHAZADA] WhatsApp rechazo el inicio de sesion ${this.forbiddenStreak} veces seguidas (403): el numero esta bloqueado o restringido. No se reconecta; se vuelve a probar en ${BaileysProvider.FORBIDDEN_PROBE_MS / 3_600_000} h.`
+    );
+    this.scheduleForbiddenProbe();
+  }
+
+  /** Un solo login de prueba despues de un rato; si vuelve a rechazar, se detiene de nuevo. */
+  private scheduleForbiddenProbe(): void {
+    if (this.forbiddenProbeTimer) clearTimeout(this.forbiddenProbeTimer);
+    this.forbiddenProbeTimer = setTimeout(() => {
+      this.forbiddenProbeTimer = null;
+      if (this.lifecycleStopped || !this.forbiddenStopped) return;
+      this.logger.log(
+        `[${new Date().toISOString()}] [BAILEYS_CUENTA_RECHAZADA] prueba periodica de login`
+      );
+      this.forbiddenProbing = true;
+      this.reconnectAttempts = 0;
+      this.reconnectWindowStartedAt = null;
+      void this.delayedReconnect();
+    }, BaileysProvider.FORBIDDEN_PROBE_MS);
+    this.forbiddenProbeTimer.unref?.();
+  }
+
+  private resetForbiddenStreak(): void {
+    this.forbiddenStreak = 0;
+    this.forbiddenSince = null;
+    this.forbiddenStopped = false;
+    this.forbiddenProbing = false;
+    if (this.forbiddenProbeTimer) clearTimeout(this.forbiddenProbeTimer);
+    this.forbiddenProbeTimer = null;
+  }
+
+  /**
    * Termina el proceso con codigo 79 porque otra conexion tomo la sesion (440).
    * Distinto de `giveUpAndExit` (codigo 1): el supervisor del host no reinicia
    * este codigo, asi no hay dos duenos peleando la misma sesion.
@@ -1742,6 +1850,24 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // para 0.1.6-beta.0 y hoy se instala 0.1.7-beta.0), asi que la intencion
     // estaba escrita pero no surtia efecto. Aca queda en el codigo.
     const bounded = this.sessionWasRegistered;
+
+    // Si la escalera se agota en medio de una racha de rechazos de la cuenta, se
+    // detiene en vez de salir: salir hace que el supervisor lo relance y la racha
+    // (en memoria) arranque de cero, que es el bucle infinito que se corrige.
+    // Exige el mismo margen de 5 min: si la escalera ya venia gastada por otros
+    // cortes, una rafaga corta de rechazos no alcanza. En ese caso sale como
+    // antes y el proceso nuevo vuelve a medir la racha desde cero.
+    if (
+      bounded &&
+      this.forbiddenStreak >= BaileysProvider.FORBIDDEN_MIN_STREAK &&
+      this.forbiddenSince !== null &&
+      now - this.forbiddenSince >= BaileysProvider.FORBIDDEN_MIN_SPAN_MS &&
+      (this.reconnectAttempts >= this.maxReconnectAttempts ||
+        elapsedMs >= BaileysProvider.MAX_RECONNECT_WINDOW_MS)
+    ) {
+      this.stopOnForbidden();
+      return;
+    }
 
     if (bounded && this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.giveUpAndExit(

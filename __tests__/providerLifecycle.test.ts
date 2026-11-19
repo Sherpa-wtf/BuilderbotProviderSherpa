@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { BaileysProvider } from '../src/bailey'
-import { makeWASocketOther } from '../src/baileyWrapper'
+import { makeWASocketOther, useMultiFileAuthState } from '../src/baileyWrapper'
 
 jest.mock('@builderbot/bot', () => ({
   ProviderClass: class extends require('node:events').EventEmitter {
@@ -249,6 +249,200 @@ describe('provider lifecycle and current QR only', () => {
       ;(other.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } })
       await flush()
       expect(reconnect).toHaveBeenCalledTimes(1)
+      expect(exit).not.toHaveBeenCalled()
+    })
+  })
+
+  // WhatsApp rechaza el login con `<failure reason="403">` (Baileys: `forbidden`, mensaje
+  // "Connection Failure") cuando el número está bloqueado o restringido. Antes el provider lo
+  // trataba como código desconocido: reintentaba ~10 min, salía con código 1 y el host lo
+  // relanzaba para siempre (bot 6af5d66e, 16 al 19-nov: 12.811 intentos, 636 relanzamientos y la
+  // app mostrando "Reconectando").
+  describe('cuenta rechazada por WhatsApp (codigo 403)', () => {
+    const MIN = 60_000
+    const HORA = 60 * MIN
+    const rechazada = { error: { message: 'Connection Failure', output: { statusCode: 403 } } }
+    const handshake403 = { error: { message: 'Unexpected server response: 403', output: { statusCode: 403 } } }
+    const close = (target: BaileysProvider, lastDisconnect: any) =>
+      (target.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect })
+    // Camino real: cada reintento abre un socket nuevo (otra generación) antes del próximo corte.
+    const golpe = async (target: BaileysProvider, lastDisconnect: any = rechazada) => {
+      close(target, lastDisconnect)
+      await flush()
+      await (target as any).initVendor()
+    }
+
+    beforeEach(() => { jest.useFakeTimers() })
+    afterEach(() => { jest.clearAllTimers(); jest.useRealTimers() })
+
+    test('una rafaga corta de rechazos se sigue reintentando: puede ser transitoria', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      for (let n = 0; n < 5; n++) { await golpe(provider); jest.advanceTimersByTime(5_000) }
+      close(provider, rechazada); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(6)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'disconnected', reasonCode: 403 })
+    })
+
+    test('rechazos sostenidos 5 min informan error 403, dejan de reconectar y no salen', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      const log = jest.spyOn((provider as any).logger, 'log')
+      await (provider as any).initVendor()
+      await golpe(provider); jest.advanceTimersByTime(2 * MIN)
+      await golpe(provider); jest.advanceTimersByTime(3 * MIN)
+      close(provider, rechazada); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(2)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('[BAILEYS_CUENTA_RECHAZADA]'))
+      jest.advanceTimersByTime(HORA)
+      expect(exit).not.toHaveBeenCalled()
+      expect(reconnect).toHaveBeenCalledTimes(2)
+    })
+
+    test('un 403 del handshake (red, no la cuenta) no cuenta: sigue la escalera normal', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      for (let n = 0; n < 4; n++) { await golpe(provider, handshake403); jest.advanceTimersByTime(2 * MIN) }
+      expect(reconnect).toHaveBeenCalledTimes(4)
+      expect(provider.getLifecycleSnapshot()?.state).not.toBe('error')
+    })
+
+    test('una conexion abierta en el medio reinicia la racha', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      await golpe(provider); jest.advanceTimersByTime(3 * MIN)
+      await golpe(provider); jest.advanceTimersByTime(3 * MIN)
+      ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
+      await golpe(provider); jest.advanceTimersByTime(MIN)
+      close(provider, rechazada); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(4)
+      expect(provider.getLifecycleSnapshot()?.state).not.toBe('error')
+    })
+
+    test('otro codigo de corte en el medio tambien reinicia la racha', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      await golpe(provider); jest.advanceTimersByTime(3 * MIN)
+      await golpe(provider); jest.advanceTimersByTime(3 * MIN)
+      await golpe(provider, { error: { message: 'Stream Errored', output: { statusCode: 503 } } })
+      close(provider, rechazada); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(4)
+      expect(provider.getLifecycleSnapshot()?.state).not.toBe('error')
+    })
+
+    const detenerPor403 = async (target: BaileysProvider) => {
+      await (target as any).initVendor()
+      await golpe(target); jest.advanceTimersByTime(3 * MIN)
+      await golpe(target); jest.advanceTimersByTime(3 * MIN)
+      close(target, rechazada); await flush()
+      expect(target.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+    }
+
+    test('recoverLifecycle no reconecta ni tapa el error mientras la cuenta esta rechazada', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await detenerPor403(provider)
+      const antes = reconnect.mock.calls.length
+      provider.recoverLifecycle()
+      await flush()
+      expect(reconnect.mock.calls.length).toBe(antes)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+    })
+
+    test('cada 6 h prueba una vez; si vuelve a rechazar queda en error sin otra rafaga', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await detenerPor403(provider)
+      const antes = reconnect.mock.calls.length
+      jest.advanceTimersByTime(6 * HORA)
+      expect(reconnect.mock.calls.length).toBe(antes + 1)
+      await (provider as any).initVendor()
+      close(provider, rechazada); await flush()
+      expect(reconnect.mock.calls.length).toBe(antes + 1)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+    })
+
+    test('si la prueba conecta, vuelve a la normalidad', async () => {
+      await detenerPor403(provider)
+      jest.advanceTimersByTime(6 * HORA)
+      await (provider as any).initVendor()
+      ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
+      expect(provider.getLifecycleSnapshot()?.state).toBe('ready')
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      const antes = reconnect.mock.calls.length
+      close(provider, rechazada); await flush()
+      expect(reconnect.mock.calls.length).toBe(antes + 1)
+    })
+
+    const escaleraAgotada = (target: BaileysProvider, sinceAgoMs: number) => {
+      ;(target as any).forbiddenStreak = 3
+      ;(target as any).forbiddenSince = Date.now() - sinceAgoMs
+      ;(target as any).sessionWasRegistered = true
+      ;(target as any).reconnectAttempts = (target as any).maxReconnectAttempts
+    }
+
+    test('si la escalera se agota con una racha de 5 min o mas, se detiene en vez de salir', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      ;(provider as any).delayedReconnect.mockRestore()
+      await (provider as any).initVendor()
+      escaleraAgotada(provider, 6 * MIN)
+      await (provider as any).delayedReconnect()
+      jest.advanceTimersByTime(5_000)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+      expect(exit).not.toHaveBeenCalled()
+    })
+
+    test('si la escalera se agota con una racha corta (gastada por otros cortes), sale como antes', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      ;(provider as any).delayedReconnect.mockRestore()
+      await (provider as any).initVendor()
+      escaleraAgotada(provider, 10_000)
+      await (provider as any).delayedReconnect()
+      jest.advanceTimersByTime(5_000)
+      expect(provider.getLifecycleSnapshot()?.state).toBe('error')
+      expect(provider.getLifecycleSnapshot()?.reasonCode).toBeUndefined()
+      expect(exit).toHaveBeenCalledWith(1)
+    })
+
+    test('escalera real: llega a los 5 min antes de agotar los reintentos y nunca sale', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      // El mock es del módulo y `restoreAllMocks` no lo devuelve: se restaura acá para que los
+      // tests siguientes vuelvan a arrancar sin sesión vinculada.
+      const original = (useMultiFileAuthState as jest.Mock).getMockImplementation()
+      ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: true }, keys: {} }, saveCreds: jest.fn() })
+      try {
+        ;(provider as any).delayedReconnect.mockRestore()
+        await (provider as any).initVendor()
+        const inicio = Date.now()
+        let cortes = 0
+        while (provider.getLifecycleSnapshot()?.state !== 'error' && cortes < 30) {
+          close(provider, rechazada); cortes += 1
+          await flush()
+          if (provider.getLifecycleSnapshot()?.state === 'error') break
+          await jest.advanceTimersByTimeAsync(31_000)
+          await flush()
+        }
+        expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+        expect(Date.now() - inicio).toBeGreaterThanOrEqual(5 * MIN)
+        expect((provider as any).reconnectAttempts).toBeLessThan((provider as any).maxReconnectAttempts)
+        expect(exit).not.toHaveBeenCalled()
+      } finally { (useMultiFileAuthState as jest.Mock).mockImplementation(original!) }
+    })
+
+    test('durante la prueba de 6 h hay socket vivo: recoverLifecycle se aplica', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await detenerPor403(provider)
+      jest.advanceTimersByTime(6 * HORA)
+      const antes = reconnect.mock.calls.length
+      provider.recoverLifecycle()
+      expect(reconnect.mock.calls.length).toBe(antes + 1)
+    })
+
+    test('dentro del host (exitOnReplaced) tampoco sale: el supervisor no tiene que relanzarlo', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      const hosted = new BaileysProvider({ name: 'lifecycle-test', exitOnReplaced: true } as any)
+      jest.spyOn(hosted as any, 'delayedReconnect').mockResolvedValue(undefined)
+      await detenerPor403(hosted)
+      jest.advanceTimersByTime(HORA)
       expect(exit).not.toHaveBeenCalled()
     })
   })
