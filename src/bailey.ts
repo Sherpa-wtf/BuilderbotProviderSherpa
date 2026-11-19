@@ -209,6 +209,12 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private maxReconnectAttempts = 20;
   private reconnectDelay = 1000; // 1 segundo inicial
 
+  /** Codigo con el que WhatsApp rechaza el login de la cuenta (`DisconnectReason.forbidden`). */
+  private static readonly WHATSAPP_FORBIDDEN = 403;
+  /** 403 seguidos, sin una conexion abierta ni otro corte en el medio, para darlo por definitivo. */
+  private static readonly MAX_FORBIDDEN_STREAK = 3;
+  private forbiddenStreak = 0;
+
   /**
    * Techo duro de la escalera de reintentos. Con 20 intentos y el cap de 30s
    * la escalera tarda ~8 min (1+2+4+8+16 + 30*15 = 481s), asi que este techo
@@ -628,6 +634,10 @@ class BaileysProvider extends ProviderClass<WASocket> {
               `[${new Date().toISOString()}] Connection closed. Status: ${statusCode}, Reason: ${reason}`
             );
 
+            // La racha de 403 solo cuenta cortes 403 seguidos: cualquier otro
+            // codigo la corta (la conexion abierta la corta en el bloque "open").
+            if (statusCode !== BaileysProvider.WHATSAPP_FORBIDDEN) this.forbiddenStreak = 0;
+
             // Casos donde NO debemos reconectar
             if (statusCode === DisconnectReason.loggedOut) {
               this.logger.log(
@@ -643,6 +653,26 @@ class BaileysProvider extends ProviderClass<WASocket> {
               // Se borro la sesion: lo que viene es un onboarding por QR, no una
               // reconexion. Sin esto el primer reintento se contaria como acotado.
               this.sessionWasRegistered = false;
+              await this.delayedReconnect();
+              return;
+            }
+
+            // Cuenta rechazada (403): el servidor de WhatsApp responde
+            // `<failure reason="403">` al login (Baileys lo llama `forbidden`),
+            // tipicamente porque el numero esta bloqueado o restringido. Reintentar
+            // no lo arregla: antes recorria la escalera, salia con codigo 1 y el
+            // supervisor lo relanzaba para siempre (bot 6af5d66e, 16 al 19-nov:
+            // 12.811 logins rechazados y la app mostrando "Reconectando").
+            // Un 403 aislado se reintenta por si es transitorio; a la tercera
+            // seguida se informa `error` con el codigo y se deja de reconectar.
+            // No se sale del proceso: asi el supervisor no lo relanza, y el
+            // reinicio diario del host (o un reinicio manual) lo vuelve a probar.
+            if (statusCode === BaileysProvider.WHATSAPP_FORBIDDEN) {
+              this.forbiddenStreak += 1;
+              if (this.forbiddenStreak >= BaileysProvider.MAX_FORBIDDEN_STREAK) {
+                this.stopOnForbidden();
+                return;
+              }
               await this.delayedReconnect();
               return;
             }
@@ -686,6 +716,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
               `[${new Date().toISOString()}] Connection opened successfully`
             );
             this.reconnectAttempts = 0; // Reset counter on successful connection
+            this.forbiddenStreak = 0;
             this.reconnectDelay = 1000; // Reset delay
             this.reconnectWindowStartedAt = null; // Arranca una racha nueva
 
@@ -1686,6 +1717,21 @@ class BaileysProvider extends ProviderClass<WASocket> {
     ]);
     // Margen para que la linea llegue a stdout antes de morir.
     setTimeout(() => process.exit(1), 1000);
+  }
+
+  /**
+   * WhatsApp rechazo el login de la cuenta varias veces seguidas (403). Se
+   * informa `error` con el codigo, que el backend muestra como "Con error", y
+   * se deja de reconectar sin terminar el proceso. A diferencia de lo que
+   * pasaba antes del 3-sep (un codigo desconocido dejaba el bot vivo y mudo
+   * figurando "Activo"), el estado queda informado de forma explicita.
+   */
+  private stopOnForbidden(): void {
+    this.qrChallenges.invalidate(this.socketGeneration);
+    this.reportLifecycle("error", BaileysProvider.WHATSAPP_FORBIDDEN);
+    this.logger.log(
+      `[${new Date().toISOString()}] [BAILEYS_CUENTA_RECHAZADA] WhatsApp rechazo el inicio de sesion ${this.forbiddenStreak} veces seguidas (403): el numero esta bloqueado o restringido. No se reconecta; el reinicio diario o uno manual lo vuelve a probar.`
+    );
   }
 
   /**

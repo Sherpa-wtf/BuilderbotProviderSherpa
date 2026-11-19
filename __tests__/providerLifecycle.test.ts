@@ -253,6 +253,78 @@ describe('provider lifecycle and current QR only', () => {
     })
   })
 
+  // WhatsApp rechaza el login con `<failure reason="403">` (Baileys: `forbidden`) cuando el
+  // número está bloqueado o restringido. Antes el provider lo trataba como código desconocido:
+  // reintentaba ~10 min, salía con código 1 y el host lo relanzaba para siempre (bot 6af5d66e,
+  // 16 al 19-nov: 12.811 intentos, 636 relanzamientos y la app mostrando "Reconectando").
+  describe('cuenta rechazada por WhatsApp (codigo 403)', () => {
+    const forbidden = { error: { output: { statusCode: 403 } } }
+    const close = (target: BaileysProvider, lastDisconnect: any) =>
+      (target.vendor as any).ev.emit('connection.update', { connection: 'close', lastDisconnect })
+
+    test('un 403 aislado se reintenta: puede ser transitorio', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      close(provider, forbidden)
+      await flush()
+      expect(reconnect).toHaveBeenCalledTimes(1)
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'disconnected', reasonCode: 403 })
+    })
+
+    test('tres 403 seguidos informan error con el codigo, dejan de reconectar y no salen', async () => {
+      jest.useFakeTimers()
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      try {
+        const reconnect = (provider as any).delayedReconnect as jest.Mock
+        const log = jest.spyOn((provider as any).logger, 'log')
+        await (provider as any).initVendor()
+        for (let n = 0; n < 3; n++) { close(provider, forbidden); await flush() }
+        expect(reconnect).toHaveBeenCalledTimes(2)
+        expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('[BAILEYS_CUENTA_RECHAZADA]'))
+        jest.advanceTimersByTime(60_000)
+        expect(exit).not.toHaveBeenCalled()
+      } finally { jest.clearAllTimers(); jest.useRealTimers() }
+    })
+
+    test('una conexion abierta en el medio reinicia la racha', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      close(provider, forbidden); await flush()
+      close(provider, forbidden); await flush()
+      ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
+      close(provider, forbidden); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(3)
+      expect(provider.getLifecycleSnapshot()?.state).not.toBe('error')
+    })
+
+    test('otro codigo de corte en el medio tambien reinicia la racha', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await (provider as any).initVendor()
+      close(provider, forbidden); await flush()
+      close(provider, forbidden); await flush()
+      close(provider, { error: { output: { statusCode: 503 } } }); await flush()
+      close(provider, forbidden); await flush()
+      expect(reconnect).toHaveBeenCalledTimes(4)
+      expect(provider.getLifecycleSnapshot()?.state).not.toBe('error')
+    })
+
+    test('dentro del host (exitOnReplaced) tampoco sale: el supervisor no tiene que relanzarlo', async () => {
+      jest.useFakeTimers()
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      try {
+        const hosted = new BaileysProvider({ name: 'lifecycle-test', exitOnReplaced: true } as any)
+        const reconnect = jest.spyOn(hosted as any, 'delayedReconnect').mockResolvedValue(undefined)
+        await (hosted as any).initVendor()
+        for (let n = 0; n < 3; n++) { close(hosted, forbidden); await flush() }
+        jest.advanceTimersByTime(60_000)
+        expect(reconnect).toHaveBeenCalledTimes(2)
+        expect(hosted.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+        expect(exit).not.toHaveBeenCalled()
+      } finally { jest.clearAllTimers(); jest.useRealTimers() }
+    })
+  })
+
   test('a new socket may require QR even when the previous socket was ready', async () => {
     await (provider as any).initVendor()
     ;(provider.vendor as any).ev.emit('connection.update', { connection: 'open' })
