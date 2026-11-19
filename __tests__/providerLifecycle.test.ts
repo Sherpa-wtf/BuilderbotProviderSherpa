@@ -405,22 +405,27 @@ describe('provider lifecycle and current QR only', () => {
 
     test('escalera real: llega a los 5 min antes de agotar los reintentos y nunca sale', async () => {
       const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      // El mock es del módulo y `restoreAllMocks` no lo devuelve: se restaura acá para que los
+      // tests siguientes vuelvan a arrancar sin sesión vinculada.
+      const original = (useMultiFileAuthState as jest.Mock).getMockImplementation()
       ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: true }, keys: {} }, saveCreds: jest.fn() })
-      ;(provider as any).delayedReconnect.mockRestore()
-      await (provider as any).initVendor()
-      const inicio = Date.now()
-      let cortes = 0
-      while (provider.getLifecycleSnapshot()?.state !== 'error' && cortes < 30) {
-        close(provider, rechazada); cortes += 1
-        await flush()
-        if (provider.getLifecycleSnapshot()?.state === 'error') break
-        await jest.advanceTimersByTimeAsync(31_000)
-        await flush()
-      }
-      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
-      expect(Date.now() - inicio).toBeGreaterThanOrEqual(5 * MIN)
-      expect((provider as any).reconnectAttempts).toBeLessThan((provider as any).maxReconnectAttempts)
-      expect(exit).not.toHaveBeenCalled()
+      try {
+        ;(provider as any).delayedReconnect.mockRestore()
+        await (provider as any).initVendor()
+        const inicio = Date.now()
+        let cortes = 0
+        while (provider.getLifecycleSnapshot()?.state !== 'error' && cortes < 30) {
+          close(provider, rechazada); cortes += 1
+          await flush()
+          if (provider.getLifecycleSnapshot()?.state === 'error') break
+          await jest.advanceTimersByTimeAsync(31_000)
+          await flush()
+        }
+        expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+        expect(Date.now() - inicio).toBeGreaterThanOrEqual(5 * MIN)
+        expect((provider as any).reconnectAttempts).toBeLessThan((provider as any).maxReconnectAttempts)
+        expect(exit).not.toHaveBeenCalled()
+      } finally { (useMultiFileAuthState as jest.Mock).mockImplementation(original!) }
     })
 
     test('durante la prueba de 6 h hay socket vivo: recoverLifecycle se aplica', async () => {
