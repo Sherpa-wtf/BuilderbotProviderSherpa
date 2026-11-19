@@ -155,7 +155,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // Con la cuenta rechazada no hay socket que recuperar: reconectar solo
     // sumaria logins rechazados y taparia el "Con error" con "Reconectando".
     // La prueba periodica de `scheduleForbiddenProbe` es la que vuelve a intentar.
-    if (this.forbiddenStopped) return;
+    // Durante esa prueba si hay un socket vivo, y la recuperacion se aplica normal.
+    if (this.forbiddenStopped && !this.forbiddenProbing) return;
     this.socketGeneration++;
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -232,6 +233,8 @@ class BaileysProvider extends ProviderClass<WASocket> {
   private forbiddenStreak = 0;
   private forbiddenSince: number | null = null;
   private forbiddenStopped = false;
+  /** Hay un login de prueba en curso (socket vivo) mientras la cuenta sigue marcada como rechazada. */
+  private forbiddenProbing = false;
   private forbiddenProbeTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
@@ -1756,6 +1759,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
    */
   private stopOnForbidden(): void {
     this.forbiddenStopped = true;
+    this.forbiddenProbing = false;
     this.qrChallenges.invalidate(this.socketGeneration);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
@@ -1775,6 +1779,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
       this.logger.log(
         `[${new Date().toISOString()}] [BAILEYS_CUENTA_RECHAZADA] prueba periodica de login`
       );
+      this.forbiddenProbing = true;
       this.reconnectAttempts = 0;
       this.reconnectWindowStartedAt = null;
       void this.delayedReconnect();
@@ -1786,6 +1791,7 @@ class BaileysProvider extends ProviderClass<WASocket> {
     this.forbiddenStreak = 0;
     this.forbiddenSince = null;
     this.forbiddenStopped = false;
+    this.forbiddenProbing = false;
     if (this.forbiddenProbeTimer) clearTimeout(this.forbiddenProbeTimer);
     this.forbiddenProbeTimer = null;
   }
@@ -1848,9 +1854,14 @@ class BaileysProvider extends ProviderClass<WASocket> {
     // Si la escalera se agota en medio de una racha de rechazos de la cuenta, se
     // detiene en vez de salir: salir hace que el supervisor lo relance y la racha
     // (en memoria) arranque de cero, que es el bucle infinito que se corrige.
+    // Exige el mismo margen de 5 min: si la escalera ya venia gastada por otros
+    // cortes, una rafaga corta de rechazos no alcanza. En ese caso sale como
+    // antes y el proceso nuevo vuelve a medir la racha desde cero.
     if (
       bounded &&
       this.forbiddenStreak >= BaileysProvider.FORBIDDEN_MIN_STREAK &&
+      this.forbiddenSince !== null &&
+      now - this.forbiddenSince >= BaileysProvider.FORBIDDEN_MIN_SPAN_MS &&
       (this.reconnectAttempts >= this.maxReconnectAttempts ||
         elapsedMs >= BaileysProvider.MAX_RECONNECT_WINDOW_MS)
     ) {

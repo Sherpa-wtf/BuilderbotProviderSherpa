@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { BaileysProvider } from '../src/bailey'
-import { makeWASocketOther } from '../src/baileyWrapper'
+import { makeWASocketOther, useMultiFileAuthState } from '../src/baileyWrapper'
 
 jest.mock('@builderbot/bot', () => ({
   ProviderClass: class extends require('node:events').EventEmitter {
@@ -373,18 +373,63 @@ describe('provider lifecycle and current QR only', () => {
       expect(reconnect.mock.calls.length).toBe(antes + 1)
     })
 
-    test('si la escalera se agota con una racha de rechazos, se detiene en vez de salir', async () => {
+    const escaleraAgotada = (target: BaileysProvider, sinceAgoMs: number) => {
+      ;(target as any).forbiddenStreak = 3
+      ;(target as any).forbiddenSince = Date.now() - sinceAgoMs
+      ;(target as any).sessionWasRegistered = true
+      ;(target as any).reconnectAttempts = (target as any).maxReconnectAttempts
+    }
+
+    test('si la escalera se agota con una racha de 5 min o mas, se detiene en vez de salir', async () => {
       const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
       ;(provider as any).delayedReconnect.mockRestore()
       await (provider as any).initVendor()
-      ;(provider as any).forbiddenStreak = 3
-      ;(provider as any).forbiddenSince = Date.now()
-      ;(provider as any).sessionWasRegistered = true
-      ;(provider as any).reconnectAttempts = (provider as any).maxReconnectAttempts
+      escaleraAgotada(provider, 6 * MIN)
       await (provider as any).delayedReconnect()
       jest.advanceTimersByTime(5_000)
       expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
       expect(exit).not.toHaveBeenCalled()
+    })
+
+    test('si la escalera se agota con una racha corta (gastada por otros cortes), sale como antes', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      ;(provider as any).delayedReconnect.mockRestore()
+      await (provider as any).initVendor()
+      escaleraAgotada(provider, 10_000)
+      await (provider as any).delayedReconnect()
+      jest.advanceTimersByTime(5_000)
+      expect(provider.getLifecycleSnapshot()?.state).toBe('error')
+      expect(provider.getLifecycleSnapshot()?.reasonCode).toBeUndefined()
+      expect(exit).toHaveBeenCalledWith(1)
+    })
+
+    test('escalera real: llega a los 5 min antes de agotar los reintentos y nunca sale', async () => {
+      const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+      ;(useMultiFileAuthState as jest.Mock).mockResolvedValue({ state: { creds: { registered: true }, keys: {} }, saveCreds: jest.fn() })
+      ;(provider as any).delayedReconnect.mockRestore()
+      await (provider as any).initVendor()
+      const inicio = Date.now()
+      let cortes = 0
+      while (provider.getLifecycleSnapshot()?.state !== 'error' && cortes < 30) {
+        close(provider, rechazada); cortes += 1
+        await flush()
+        if (provider.getLifecycleSnapshot()?.state === 'error') break
+        await jest.advanceTimersByTimeAsync(31_000)
+        await flush()
+      }
+      expect(provider.getLifecycleSnapshot()).toMatchObject({ state: 'error', reasonCode: 403 })
+      expect(Date.now() - inicio).toBeGreaterThanOrEqual(5 * MIN)
+      expect((provider as any).reconnectAttempts).toBeLessThan((provider as any).maxReconnectAttempts)
+      expect(exit).not.toHaveBeenCalled()
+    })
+
+    test('durante la prueba de 6 h hay socket vivo: recoverLifecycle se aplica', async () => {
+      const reconnect = (provider as any).delayedReconnect as jest.Mock
+      await detenerPor403(provider)
+      jest.advanceTimersByTime(6 * HORA)
+      const antes = reconnect.mock.calls.length
+      provider.recoverLifecycle()
+      expect(reconnect.mock.calls.length).toBe(antes + 1)
     })
 
     test('dentro del host (exitOnReplaced) tampoco sale: el supervisor no tiene que relanzarlo', async () => {
